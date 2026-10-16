@@ -310,10 +310,10 @@ detect_ip() {
 
 # ---------------- 8. 证书与密钥 ----------------
 gen_crypto() {
-    mkdir -p "$STAGE_DIR/bin"
-    # 自签证书 (hy2/tuic/trojan/anytls 共用)
-    openssl req -x509 -newkey rsa:2048 -keyout "$STAGE_DIR/bin/tls.key" \
-        -out "$STAGE_DIR/bin/tls.cer" -days 3650 -nodes \
+    mkdir -p "$(dirname "$CER_PATH")"
+    # 自签证书 (hy2/tuic/trojan/anytls 共用); 写入 CER_PATH/KEY_PATH (dry-run 时在 staging，正式时直接进 /etc/sing-box)
+    openssl req -x509 -newkey rsa:2048 -keyout "$KEY_PATH" \
+        -out "$CER_PATH" -days 3650 -nodes \
         -subj "/CN=${ANYTLS_SNI}" 2>/dev/null || die "openssl cert failed"
     # reality keypair
     local out
@@ -680,9 +680,11 @@ install_files() {
     if [[ "$STAGE_BIN" != "$SB_BIN" ]]; then
         cp -f "$STAGE_BIN" "$SB_BIN" && chmod +x "$SB_BIN"
     fi
-    # tls cert
-    cp -f "$STAGE_DIR/bin/tls.cer" "$SB_DIR/bin/tls.cer"
-    cp -f "$STAGE_DIR/bin/tls.key" "$SB_DIR/bin/tls.key"
+    # tls cert (gen_crypto 已按 CER_PATH/KEY_PATH 生成；正式部署时已在目标位置，无需拷贝)
+    if [[ "$CER_PATH" != "$SB_DIR/bin/tls.cer" ]]; then
+        cp -f "$CER_PATH" "$SB_DIR/bin/tls.cer"
+        cp -f "$KEY_PATH" "$SB_DIR/bin/tls.key"
+    fi
     chmod 600 "$SB_DIR/bin/tls.key"
     # configs
     cp -f "$BUILD_BASE" "$SB_DIR/config.json"
