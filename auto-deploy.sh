@@ -873,9 +873,19 @@ cmd_nodes() { # 显示所有分享链接
     cat "$f"
 }
 
-cmd_uninstall() { # 卸载: 转发给管理脚本 + 清理本脚本的附加项
-    [[ -x "$MGMT_BIN" ]] || die "管理脚本未安装，无需卸载"
-    "$MGMT_BIN" uninstall "$@"
+cmd_uninstall() { # 卸载: 转发给管理脚本 (缺失时走手动流程) + 清理本脚本的附加项
+    if [[ -x "$MGMT_BIN" ]]; then
+        "$MGMT_BIN" uninstall "$@"
+    else
+        warn "管理脚本未安装，执行手动卸载流程"
+        systemctl stop sing-box 2>/dev/null || true
+        systemctl disable sing-box 2>/dev/null || true
+        rm -rf "$SB_DIR" /var/log/sing-box /usr/local/bin/sing-box /usr/local/bin/sb \
+            /lib/systemd/system/sing-box.service
+        sed -i "/alias sing-box=/d" /root/.bashrc 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        ok "sing-box 已手动卸载"
+    fi
     # 清理 auto-deploy.sh 的附加项 (原管理脚本不认识它们)
     if systemctl list-unit-files 2>/dev/null | grep -q "^sb-porthopping.service"; then
         systemctl disable --now sb-porthopping 2>/dev/null || true
