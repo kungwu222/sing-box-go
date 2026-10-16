@@ -1,0 +1,42 @@
+# cloud-init 示例: sing-box 全自动部署
+# 用法: 将本文件内容作为云厂商自定义数据 (user-data) 粘贴,或合并到现有 cloud-config
+
+#cloud-config
+
+write_files:
+  # 可选: 预置 TLS 证书 (供 vlessws/vmessws/trojws 使用;不需要可删除)
+  # - path: /root/fullchain.pem
+  #   permissions: '0644'
+  #   content: |
+  #     -----BEGIN CERTIFICATE-----
+  #     ...
+  # - path: /root/privkey.pem
+  #   permissions: '0600'
+  #   content: |
+  #     -----BEGIN PRIVATE KEY-----
+  #     ...
+
+runcmd:
+  # 1. 下载部署脚本 (换成你实际托管的地址)
+  - curl -fsSL https://example.com/auto-deploy.sh -o /root/auto-deploy.sh
+  - chmod +x /root/auto-deploy.sh
+
+  # 2a. 全默认部署 (reality,hy2,anytls,vlesstcp,端口/密码全自动)
+  - /root/auto-deploy.sh
+
+  # 2b. 自定义示例 (二选一,把 2a 注释掉):
+  # - >
+  #   DOWNLOAD_PROXY=https://gh-proxy.com/
+  #   /root/auto-deploy.sh
+  #   --protocols reality,hy2,anytls
+  #   --hy2-hopping-range 20000-40000
+  #   --password "在这里填固定密码,所有机器统一"
+
+  # 3. 查看结果 (日志在 /var/log/cloud-init-output.log)
+  - cat /etc/sing-box/nodes.txt
+
+# 说明:
+# - 脚本幂等,可重复执行;已安装相同版本时跳过下载
+# - 部署结果: /etc/sing-box/nodes.txt(分享链接) /etc/sing-box/deploy-result.json
+# - Hy2 跳跃: iptables/nftables REDIRECT + 开机自启恢复(sb-porthopping.service)
+# - 管理命令(已安装原仓库脚本): sing-box info <name> / sing-box url <name>
