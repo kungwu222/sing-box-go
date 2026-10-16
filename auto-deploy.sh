@@ -827,7 +827,7 @@ print_summary() {
     echo "================ 部署完成 ================"
     echo "sing-box: $SB_VERSION | server: $SERVER_IP"
     echo ""
-    printf '%s\n' "${NODES_JSON[@]}" | jq -s -r '.[] | "\(.protocol) [\(.port)]: \(.url // "-")"'
+    printf '%s\n' "${NODES_JSON[@]}" | jq -s -r '.[] | "\(.protocol) [\(.port)]:\n\(.url // "-")"'
     echo ""
     if is_true "$DRY_RUN"; then
         echo "(dry-run: 未修改系统, 配置见 $STAGE_DIR)"
