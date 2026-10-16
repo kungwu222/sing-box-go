@@ -648,6 +648,23 @@ install_mgmt_script() {
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sing-box
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sb
     grep -q 'alias sb=' /root/.bashrc 2>/dev/null || echo "alias sb=/usr/local/bin/sing-box" >>/root/.bashrc
+    # qrencode: `sbgo qr` 依赖 (原包 install.sh 的 is_pkg 之一)；装不上也不致命
+    if ! command -v qrencode >/dev/null 2>&1; then
+        local pm="${PKG_MGR:-}"
+        if [[ -z "$pm" ]]; then
+            if command -v apt-get >/dev/null 2>&1; then pm="apt-get"
+            elif command -v dnf >/dev/null 2>&1; then pm="dnf"
+            elif command -v yum >/dev/null 2>&1; then pm="yum"; fi
+        fi
+        if [[ -n "$pm" ]]; then
+            log "installing qrencode..."
+            if [[ "$pm" == "apt-get" ]]; then
+                apt-get update -qq 2>/dev/null; apt-get install -y -qq qrencode 2>/dev/null || true
+            else
+                $pm install -y -q qrencode 2>/dev/null || true
+            fi
+        fi
+    fi
     ok "management script installed (sing-box / sb)"
 }
 
