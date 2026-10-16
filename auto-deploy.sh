@@ -99,6 +99,7 @@ usage() {
     echo "  change <name> <opt> <val>    修改节点参数"
     echo "  list                         列出所有节点 (管理脚本没有此命令)"
     echo "  nodes                        显示所有分享链接"
+    echo "  uninstall                    卸载 (转发管理脚本 + 清理 sbgo 附加项)"
     echo "  status|log|start|stop|restart 服务管理"
     echo ""
     echo "Deploy options (all can also be set via environment variables,"
@@ -872,6 +873,22 @@ cmd_nodes() { # 显示所有分享链接
     cat "$f"
 }
 
+cmd_uninstall() { # 卸载: 转发给管理脚本 + 清理本脚本的附加项
+    [[ -x "$MGMT_BIN" ]] || die "管理脚本未安装，无需卸载"
+    "$MGMT_BIN" uninstall "$@"
+    # 清理 auto-deploy.sh 的附加项 (原管理脚本不认识它们)
+    if systemctl list-unit-files 2>/dev/null | grep -q "^sb-porthopping.service"; then
+        systemctl disable --now sb-porthopping 2>/dev/null || true
+        rm -f /lib/systemd/system/sb-porthopping.service
+        systemctl daemon-reload 2>/dev/null || true
+        ok "sb-porthopping.service removed"
+    fi
+    if [[ -L /usr/local/bin/sbgo ]]; then
+        rm -f /usr/local/bin/sbgo
+        ok "sbgo shortcut removed"
+    fi
+}
+
 is_mgmt_cmd() { # 是否为转发给管理脚本的子命令
     case "$1" in
         add|del|ddel|info|url|qr|change|status|start|stop|restart|log|test|bbr|v|version|ip|pbk|get-port|ss2022|ddns|dns|fix|fix-all|import|gen|debug|full|id|host|port|path|passwd|key|method|sni|new|web|bin|u|U|un|s|socks)
@@ -890,6 +907,7 @@ mgmt_usage() { # sbgo 快捷入口的帮助
     echo "  sbgo info|url|qr <name>      查看节点信息 / 分享链接 / 二维码"
     echo "  sbgo change <name> <k> <v>   修改节点参数"
     echo "  sbgo status|log|restart      服务管理"
+    echo "  sbgo uninstall             卸载 (含 sb-porthopping.service 和 sbgo 自身)"
     echo "  sbgo deploy [options]        重新部署 (需显式指定)"
 }
 
@@ -897,13 +915,14 @@ sbgo_main() { # 以 sbgo 之名被调用时的入口 (管理模式，无参数�
     case "${1:-}" in
         ""|-h|--help) mgmt_usage ;;
         deploy) shift; deploy_flow "$@" ;;
+        uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
         --*) die "sbgo 是管理快捷命令；要部署请用: sbgo deploy [options]" ;;
         *) if is_mgmt_cmd "$1"; then mgmt_forward "$@"
            else die "unknown command: $1
 
-sbgo {list|nodes|add|del|info|url|qr|change|status|log|...} | sbgo deploy [options]"
+sbgo {list|nodes|add|del|info|url|qr|change|status|log|uninstall|...} | sbgo deploy [options]"
            fi ;;
     esac
 }
@@ -931,6 +950,7 @@ main() {
     case "${1:-}" in
         ""|--*) deploy_flow "$@" ;;
         deploy) shift; deploy_flow "$@" ;;
+        uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
         -h|--help) usage ;;
@@ -938,8 +958,8 @@ main() {
            else die "unknown command: $1
 
 部署: $0 [--protocols ...] [--dry-run]
-管理: $0 {add|del|info|url|qr|change|list|nodes|status|log} ...
-快捷: sbgo {list|nodes|add|del|info|url|...}
+管理: $0 {add|del|info|url|qr|change|list|nodes|status|log|uninstall} ...
+快捷: sbgo {list|nodes|add|del|info|url|uninstall|...}
 帮助: $0 --help"
            fi ;;
     esac
