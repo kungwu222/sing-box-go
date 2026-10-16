@@ -15,7 +15,7 @@
 
 ```bash
 # 1. 下载
-curl -fsSL https://github.com/kungwu222/sing-box-go -o /root/auto-deploy.sh
+curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/auto-deploy.sh -o /root/auto-deploy.sh
 chmod +x /root/auto-deploy.sh
 
 # 2a. 先预演（推荐）
