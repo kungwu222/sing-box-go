@@ -62,13 +62,14 @@ DIRECT_RPORT|direct-rport|
 ENABLE_BBR|enable-bbr|true
 OPEN_FIREWALL|open-firewall|true
 INSTALL_MGMT|install-mgmt|true
+MGMT_URL|mgmt-url|https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/mgmt-code.tar.gz
 DRY_RUN|dry-run|false
 FORCE|force|false
 "
 
 FALLBACK_VERSION="v1.14.3"
 SB_REPO="SagerNet/sing-box"
-MGMT_REPO="ooplastone22/sing-box"
+# 管理脚本不再默认从上游下载；通过 MGMT_URL 参数指定来源 (默认: 用户自己的 git 仓库中的 vendored tarball)
 
 SB_DIR="/etc/sing-box"
 SB_BIN="$SB_DIR/bin/sing-box"
@@ -99,6 +100,7 @@ usage() {
     echo "  change <name> <opt> <val>    修改节点参数"
     echo "  list                         列出所有节点 (管理脚本没有此命令)"
     echo "  nodes                        显示所有分享链接"
+    echo "  install-mgmt                 单独安装管理脚本 (不重部署)"
     echo "  uninstall                    卸载 (转发管理脚本 + 清理 sbgo 附加项)"
     echo "  status|log|start|stop|restart 服务管理"
     echo ""
@@ -623,7 +625,10 @@ validate_config() {
 # ---------------- 11. 安装 ----------------
 install_mgmt_script() {
     is_true "$INSTALL_MGMT" || return 0
-    local url="https://github.com/${MGMT_REPO}/releases/latest/download/code.tar.gz"
+    # 管理脚本来源: 默认从用户自己的 git 仓库 (vendored tarball)，可用 --mgmt-url 覆盖；
+    # MGMT_URL 为空 = 不下载 (不再静默回退上游)
+    [[ -z "$MGMT_URL" ]] && { warn "MGMT_URL is empty, management script skipped"; return 0; }
+    local url="$MGMT_URL"
     local tmp="$STAGE_DIR/code.tar.gz"
     dl "$url" "$tmp" || { warn "management script download failed, skipped"; return 0; }
     mkdir -p "$SH_DIR"
@@ -639,6 +644,7 @@ install_mgmt_script() {
         fi
     fi
     [[ -f "$SH_DIR/sing-box.sh" ]] || { warn "management script layout unexpected"; return 0; }
+    chmod +x "$SH_DIR/sing-box.sh"
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sing-box
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sb
     grep -q 'alias sb=' /root/.bashrc 2>/dev/null || echo "alias sb=/usr/local/bin/sing-box" >>/root/.bashrc
@@ -875,6 +881,16 @@ cmd_nodes() { # 显示所有分享链接
     cat "$f"
 }
 
+cmd_install_mgmt() { # 单独安装/重装管理脚本 (不重部署、不轮换密码)
+    STAGE_DIR=$(mktemp -d)
+    dl_init
+    INSTALL_MGMT=true
+    install_mgmt_script
+    rm -rf "$STAGE_DIR"
+    [[ -x /usr/local/bin/sing-box ]] && ok "管理脚本可用: sing-box / sb" \
+        || die "管理脚本安装失败，请检查网络后重试 (可这样走代理: DOWNLOAD_PROXY=https://gh-proxy.com/ sbgo install-mgmt)"
+}
+
 cmd_uninstall() { # 卸载: 转发给管理脚本 (缺失时走手动流程) + 清理本脚本的附加项
     if [[ -x "$MGMT_BIN" ]]; then
         "$MGMT_BIN" uninstall "$@"
@@ -919,6 +935,7 @@ mgmt_usage() { # sbgo 快捷入口的帮助
     echo "  sbgo info|url|qr <name>      查看节点信息 / 分享链接 / 二维码"
     echo "  sbgo change <name> <k> <v>   修改节点参数"
     echo "  sbgo status|log|restart      服务管理"
+    echo "  sbgo install-mgmt          单独安装管理脚本 (下载失败时重试，不重部署)"
     echo "  sbgo uninstall             卸载 (含 sb-porthopping.service 和 sbgo 自身)"
     echo "  sbgo deploy [options]        重新部署 (需显式指定)"
 }
@@ -927,6 +944,7 @@ sbgo_main() { # 以 sbgo 之名被调用时的入口 (管理模式，无参数�
     case "${1:-}" in
         ""|-h|--help) mgmt_usage ;;
         deploy) shift; deploy_flow "$@" ;;
+        install-mgmt) cmd_install_mgmt ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
@@ -934,7 +952,7 @@ sbgo_main() { # 以 sbgo 之名被调用时的入口 (管理模式，无参数�
         *) if is_mgmt_cmd "$1"; then mgmt_forward "$@"
            else die "unknown command: $1
 
-sbgo {list|nodes|add|del|info|url|qr|change|status|log|uninstall|...} | sbgo deploy [options]"
+sbgo {list|nodes|add|del|info|url|qr|change|status|log|install-mgmt|uninstall|...} | sbgo deploy [options]"
            fi ;;
     esac
 }
@@ -962,6 +980,7 @@ main() {
     case "${1:-}" in
         ""|--*) deploy_flow "$@" ;;
         deploy) shift; deploy_flow "$@" ;;
+        install-mgmt) cmd_install_mgmt ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
@@ -970,8 +989,8 @@ main() {
            else die "unknown command: $1
 
 部署: $0 [--protocols ...] [--dry-run]
-管理: $0 {add|del|info|url|qr|change|list|nodes|status|log|uninstall} ...
-快捷: sbgo {list|nodes|add|del|info|url|uninstall|...}
+管理: $0 {add|del|info|url|qr|change|list|nodes|status|log|install-mgmt|uninstall} ...
+快捷: sbgo {list|nodes|add|del|info|url|install-mgmt|uninstall|...}
 帮助: $0 --help"
            fi ;;
     esac
