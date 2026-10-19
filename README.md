@@ -1,7 +1,5 @@
 # sing-box 全自动部署脚本
 
-基于 [ooplastone22/sing-box](https://github.com/ooplastone22/sing-box) 重构的**无人值守**部署脚本。
-
 ## 特性
 
 - **全程无交互**：所有参数通过环境变量或命令行传入，可直接塞进云厂商的 cloud-init 开机执行
