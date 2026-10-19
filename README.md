@@ -1,5 +1,7 @@
 # sing-box 全自动部署脚本
 
+基于 [ooplastone22/sing-box](https://github.com/ooplastone22/sing-box) 重构的**无人值守**部署脚本。
+
 ## 特性
 
 - **全程无交互**：所有参数通过环境变量或命令行传入，可直接塞进云厂商的 cloud-init 开机执行
@@ -14,21 +16,21 @@
 ## 快速开始
 
 ```bash
-# 1. 下载
+# 方式一：一键部署（推荐，install.sh 会下载 auto-deploy.sh 并用内置默认参数部署）
+curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/install.sh | sudo bash
+
+# 方式二：手动两步（想先看参数/预演时用）
 curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/auto-deploy.sh -o /root/auto-deploy.sh
 chmod +x /root/auto-deploy.sh
+/root/auto-deploy.sh --dry-run   # 先预演（推荐）
+/root/auto-deploy.sh             # 正式部署（默认：reality + hy2 + anytls + vlesstcp）
 
-# 2a. 先预演（推荐）
-/root/auto-deploy.sh --dry-run
-
-# 2b. 正式部署（默认：reality + hy2 + anytls + vlesstcp）
-/root/auto-deploy.sh
-
-# 3. 查看节点
+# 查看节点
 cat /etc/sing-box/nodes.txt
 ```
 
 > 需要 root 权限，且系统要有 systemd。
+> install.sh 的内置默认参数见其文件头的 `DEFAULT_ARGS`；运行时覆盖：`... | sudo bash -s -- --reality-port 8443`。
 
 ## 参数说明
 
@@ -59,6 +61,7 @@ runcmd:
 | `ENABLE_BBR` | `--enable-bbr` | `true` | 是否开启 BBR 拥塞控制 |
 | `OPEN_FIREWALL` | `--open-firewall` | `true` | 是否自动放行相关端口（ufw / firewalld / iptables，尽力而为） |
 | `INSTALL_MGMT` | `--install-mgmt` | `true` | 是否安装原仓库管理脚本（`sing-box` / `sb` 命令） |
+| `MGMT_URL` | `--mgmt-url` | 你自己 git 仓库的 `mgmt-code.tar.gz` | 管理脚本 tarball 下载地址；设为空则不下载 |
 | `DRY_RUN` | `--dry-run` | `false` | 预演模式：只生成+校验配置，不修改系统 |
 | `FORCE` | `--force` | `false` | 强制重新下载安装（即使已是目标版本） |
 
@@ -159,13 +162,15 @@ DOWNLOAD_PROXY=https://gh-proxy.com/ ./auto-deploy.sh
 ```yaml
 #cloud-config
 runcmd:
-  - curl -fsSL https://example.com/auto-deploy.sh -o /root/auto-deploy.sh
-  - chmod +x /root/auto-deploy.sh
-  - /root/auto-deploy.sh --protocols reality,hy2,anytls,vlesstcp
+  # 默认参数一键部署（runcmd 已是 root，不需要 sudo）
+  - curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/install.sh | bash
+  # 覆盖参数（把上面注释掉）：
+  # - curl -fsSL .../install.sh | bash -s -- --reality-port 8443
   - cat /etc/sing-box/nodes.txt
 ```
 
 完整示例见 `cloud-init-example.yaml`。部署日志在 `/var/log/cloud-init-output.log`。
+注意用 `runcmd`（网络就绪后执行），不要用 `bootcmd`（执行太早网络可能没起来）。
 
 ## Hysteria2 端口跳跃说明
 
@@ -202,19 +207,46 @@ runcmd:
 
 systemd 服务：`sing-box.service`、`sb-porthopping.service`（仅 hy2 跳跃启用时）。
 
-## 管理命令（已安装原仓库脚本时可用）
+## 管理命令
+
+部署完成后会自动安装统一快捷入口 **`sbgo`**（`/usr/local/bin/sbgo`，符号链接到部署脚本自身），
+一个命令搞定所有管理操作。
+
+### 管理脚本来源（vendored，不再直连上游）
+
+`sbgo add/del/info/url` 等命令转发给原仓库的管理脚本。它的 tarball 已打包为 **`mgmt-code.tar.gz`**
+（38KB，GPLv3），**提交到你自己的 git 仓库**（与 `auto-deploy.sh` 同目录），部署时从 `MGMT_URL`
+下载——不再从上游 `ooplastone22/sing-box` 的 releases 拉取：
+
+- 更新管理脚本版本时：重新下载上游 `code.tar.gz`，覆盖掉你仓库里的 `mgmt-code.tar.gz` 并推送
+  （注意 raw.githubusercontent.com 有 CDN 缓存，推送后等几分钟或 URL 加 `?t=` 破缓存；
+  如需给管理脚本打补丁——已内置：anytls/vlesstcp 的 `info`/`url` 支持、hy2 链接的 `mport`
+  跳跃段（`hy2://` scheme + 真实 tag）、带空格文件名的引用修复、`restart`/`start`/`stop`
+  前台执行+成功确认输出、`qr` 默认 UTF8 半尺寸——改完 `src/core.sh` 后重新打包）
+- 想彻底不用它：`--install-mgmt false`（或 `MGMT_URL` 设为空）
 
 ```bash
-sbgo list                    # 列出所有节点
+sbgo list                    # 列出所有节点（协议/端口一览，原管理脚本没有此命令）
 sbgo nodes                   # 显示所有分享链接
 sbgo add hy2 8443 mypass     # 添加节点
-sbgo del default-hy2-8443    # 删除节点
-sbgo info|url|qr <name>      # 查看/链接/二维码
-sbgo change <name> port 9443 # 改参数
-sbgo status|log|restart      # 服务管理
-sbgo deploy --protocols hy2  # 重新部署（需显式指定）
-
+sbgo del default-hy2-8443    # 删除节点（直接删，无确认，谨慎）
+sbgo info <name>             # 查看节点信息（含 anytls，已给 vendored 管理脚本打补丁支持）
+sbgo url <name>              # 输出分享链接
+sbgo qr <name>               # 二维码（默认 UTF8 半块字符，约 ANSI 一半大小；调尺寸：QR_MARGIN=1 sbgo qr，老终端：QR_TYPE=ANSI sbgo qr）
+sbgo change <name> port 9443 # 修改节点参数
+sbgo status | sbgo log       # 服务管理
+sbgo restart                 # 重启服务（成功会打印确认，前台执行）
+sbgo install-mgmt          # 单独安装/重装管理脚本（下载失败时重试，不重部署、不轮换密码）
+sbgo uninstall             # 卸载（含 sb-porthopping.service 和 sbgo 快捷入口自身）
+sbgo deploy --protocols hy2  # 重新部署（需显式指定，避免误触）
 ```
+
+说明：
+
+- `add/del/info/url/qr/change/status/log` 等**转发**给原仓库管理脚本（`sing-box` / `sb` 命令），行为完全一致；用 `sb` 也一样，只是少了 `list`/`nodes`
+- `list` 和 `nodes` 是**原生实现**的：`list` 读 `/etc/sing-box/conf/` 解析协议/端口成表格
+- **安全设计**：`sbgo` 无参数时只显示帮助，**不会**触发部署（重跑部署会重新随机生成密码，误触代价大）；想重部署必须显式写 `sbgo deploy`
+- 如果部署时 `INSTALL_MGMT=false`，`add/del` 等转发类命令不可用（会明确报错），`list`/`nodes` 不受影响
 
 ## FAQ
 
@@ -234,7 +266,7 @@ A: 通过 cloud-init `write_files` 把证书放到机器上，再传 `--tls-cert
 A: 直接重跑脚本（默认 `latest`，检测到新版本会自动下载替换并重启服务）。
 
 **Q: 如何卸载？**
-A: 装了管理脚本的话用 `sing-box uninstall`；否则手动 `systemctl disable --now sing-box sb-porthopping` 并删除 `/etc/sing-box`。
+A: `sbgo uninstall` —— 会调用原管理脚本的卸载（停服务、删 `/etc/sing-box`、删 systemd 服务），并额外清理本脚本的 `sb-porthopping.service` 和 `sbgo` 快捷入口自身。
 
 **Q: 随机生成的密码在哪看？**
 A: `/etc/sing-box/nodes.txt` 和 `deploy-result.json` 里都有，妥善保存。
@@ -244,4 +276,5 @@ A: `/etc/sing-box/nodes.txt` 和 `deploy-result.json` 里都有，妥善保存�
 1. 需要 root 权限 + systemd（绝大多数云主机镜像都满足）。
 2. 自签证书的协议（hy2/tuic/trojan/anytls/vmess-quic）客户端需开启"跳过证书验证"（`insecure`/`allowInsecure`），分享链接已默认带上。
 3. `sb-porthopping.service` 依赖 iptables/nftables，极简镜像请确保其一可用（脚本会尝试自动安装 iptables）。
-4. 部署后建议先用 `--dry-run` 在同类机器上验证参数，再批量推 cloud-init。
+4. `sbgo qr` 需要 `qrencode`，装管理脚本时会自动安装（apt/yum/dnf）。
+5. 部署后建议先用 `--dry-run` 在同类机器上验证参数，再批量推 cloud-init。
