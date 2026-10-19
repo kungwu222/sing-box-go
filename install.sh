@@ -5,8 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/install.sh | sudo bash
 #
 # 用法 2 (运行时传参, 覆盖内置默认值; 注意 bash -s -- 的写法):
-#   curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/install.sh \
-#     | sudo bash -s -- --name "mynodename" --reality-port 8443 --reality-sni www.apple.com --dry-run
+#   curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/install.sh | sudo bash -s -- --name "mynodename" --reality-port 8443 --reality-sni www.apple.com --dry-run
 #
 # 用法 3 (改默认值): 直接编辑下面 DEFAULT_ARGS 数组, 推到 git 即可。
 #   也支持环境变量方式(需 sudo -E 保留环境):
