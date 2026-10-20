@@ -30,14 +30,14 @@ REALITY_SNI|reality-sni|www.icloud.com
 HY2_PORT|hy2-port|8443
 HY2_PASSWORD|hy2-password|
 HY2_HOPPING|hy2-hopping|true
-HY2_HOPPING_RANGE|hy2-hopping-range|20000-50000
+HY2_HOPPING_RANGE|hy2-hopping-range|60000-64000
 HY2_HOP_INTERVAL|hy2-hop-interval|30s
 HY2_HOP_INTERVAL_MAX|hy2-hop-interval-max|
 ANYTLS_PORT|anytls-port|9443
 ANYTLS_PASSWORD|anytls-password|
 ANYTLS_SNI|anytls-sni|www.bing.com
 VLESSTCP_PORT|vlesstcp-port|18090
-TUIC_PORT|tuic-port|24443
+TUIC_PORT|tuic-port|18093
 TUIC_PASSWORD|tuic-password|
 VMESSTCP_PORT|vmesstcp-port|18091
 VMESSQUIC_PORT|vmessquic-port|18092
@@ -383,7 +383,7 @@ add_hy2() {
     fi
     url="${url}#${NODE_NAME}-hy2"
     # sing-box 原生客户端配置 (server_ports 与 server_port 互斥,官方文档确认)
-    # 注意: server_ports 范围格式用冒号 "20000:50000",与 mport(URL)/防火墙惯例的横杠不同
+    # 注意: server_ports 范围格式用冒号（例 "60000:64000"）,与 mport(URL)/防火墙惯例的横杠不同
     local cf_name="${NODE_NAME}-hy2-client.json"
     local cf="$CLIENT_OUT/$cf_name"
     local cf_final="$FINAL_CLIENT_DIR/$cf_name"
@@ -582,6 +582,17 @@ add_direct() {
 
 deploy_protocols() {
     [[ -z "$PROTOCOLS" ]] && die "PROTOCOLS is empty"
+    # 跳跃段内的 UDP 流量会被 REDIRECT 到 hy2 端口: UDP 协议端口落在段内会直接被劫持, 部署前拦截
+    if is_true "$HY2_HOPPING" && grep -qi "hy2" <<<"$PROTOCOLS"; then
+        local hs="${HY2_HOPPING_RANGE%-*}" he="${HY2_HOPPING_RANGE#*-}" _pp _pn
+        for _pp in "tuic:$TUIC_PORT" "vmessquic:$VMESSQUIC_PORT"; do
+            _pn="${_pp%%:*}"
+            grep -qi "$_pn" <<<"$PROTOCOLS" || continue
+            if (( ${_pp##*:} >= hs && ${_pp##*:} <= he )); then
+                die "$_pn port ${_pp##*:} is inside hy2 hopping range $HY2_HOPPING_RANGE -- its UDP traffic would be redirected to hy2 ($HY2_PORT); pick a $_pn port outside the range or change --hy2-hopping-range"
+            fi
+        done
+    fi
     for p in ${PROTOCOLS//,/ }; do
         case "${p,,}" in
             reality)   add_reality ;;
@@ -727,16 +738,24 @@ setup_hopping() {
     local start="${HY2_HOPPING_RANGE%-*}" end="${HY2_HOPPING_RANGE#*-}" to="$HY2_PORT"
     cat > "$SB_DIR/hy2-hopping.sh" <<EOF
 #!/bin/bash
-# auto-generated: hy2 port hopping NAT rules (idempotent)
+# auto-generated: hy2 port hopping NAT rules (idempotent; removes stale ranges)
 START=$start; END=$end; TO=$to
-if command -v iptables >/dev/null 2>&1; then
-  iptables -t nat -C PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO 2>/dev/null || \
-  iptables -t nat -A PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO
-fi
-if command -v ip6tables >/dev/null 2>&1; then
-  ip6tables -t nat -C PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO 2>/dev/null || \
-  ip6tables -t nat -A PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO
-fi
+_hop_apply() {
+  local ipt=\$1
+  command -v \$ipt >/dev/null 2>&1 || return 0
+  # 清理旧跳跃段遗留规则: REDIRECT 到 \$TO 但 dport 范围不是当前的, 删掉
+  # (否则段内其他 UDP 服务——如 sbgo add 的随机端口 tuic——会被劫持到 hy2)
+  \$ipt -t nat -S PREROUTING 2>/dev/null | grep -- "--to-ports \$TO" | while IFS= read -r line; do
+    case "\$line" in
+      *"--dport \$START:\$END"*) ;;
+      *) \$ipt -t nat -D \${line#-A } 2>/dev/null || true ;;
+    esac
+  done
+  \$ipt -t nat -C PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO 2>/dev/null || \
+  \$ipt -t nat -A PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO
+}
+_hop_apply iptables
+_hop_apply ip6tables
 if ! command -v iptables >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
   nft list chain ip nat PREROUTING 2>/dev/null | grep -q "udp dport \$START-\$END" || \
   nft add rule ip nat PREROUTING udp dport \$START-\$END redirect to :\$TO 2>/dev/null || true
