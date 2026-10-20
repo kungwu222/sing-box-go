@@ -911,10 +911,44 @@ cmd_list() { # 列出所有节点 (管理脚本没有 list 命令，这里补上
     [[ $found -eq 0 ]] && echo "(empty)"
 }
 
-cmd_nodes() { # 显示所有分享链接
-    local f="$SB_DIR/nodes.txt"
-    [[ -f "$f" ]] || die "nodes.txt 不存在: $f (还未部署?)"
-    cat "$f"
+cmd_nodes() { # 显示所有分享链接 (以当前 conf 目录为准, 包含 sbgo add 后加的节点)
+    local d="$CONF_DIR"
+    [[ -d "$d" ]] || die "conf dir 不存在: $d (还未部署?)"
+    command -v jq >/dev/null 2>&1 || die "需要 jq"
+    # 管理脚本缺失时 (跳过安装的用户), 回退到部署时的静态产物
+    if [[ ! -x "$MGMT_BIN" ]]; then
+        local nf="$SB_DIR/nodes.txt"
+        [[ -f "$nf" ]] || die "nodes.txt 不存在: $nf (还未部署?)"
+        cat "$nf"
+        return 0
+    fi
+    local f found=0
+    for f in "$d"/*.json; do
+        [[ -f "$f" ]] || continue
+        found=1
+        local name proto port url
+        name=$(basename "$f" .json)
+        proto=$(jq -r '.inbounds[0].type // "-"' "$f" 2>/dev/null)
+        port=$(jq -r '.inbounds[0].listen_port // "-"' "$f" 2>/dev/null)
+        echo "$proto [$port]:"
+        url=$(_mgmt_node_url "$f") || url=""
+        if [[ -n "$url" ]]; then
+            echo "$url"
+        else
+            echo "(url unavailable)"
+        fi
+        echo ""
+    done
+    [[ $found -eq 0 ]] && echo "(empty)"
+}
+
+_mgmt_node_url() { # 通过管理脚本取单个 conf 的分享链接 (走它打过补丁的 info/url 逻辑)
+    local f="$1" out u
+    [[ -x "$MGMT_BIN" ]] || return 1
+    out=$("$MGMT_BIN" url "$(basename "$f")" 2>/dev/null | sed -r 's/\x1b\[[0-9;]*m//g')
+    u=$(grep -m1 '://' <<<"$out")
+    [[ -n "$u" ]] || return 1
+    printf '%s\n' "$u"
 }
 
 cmd_install_mgmt() { # 单独安装/重装管理脚本 (不重部署、不轮换密码)
