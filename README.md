@@ -29,6 +29,9 @@ cat /etc/sing-box/nodes.txt
 
 > 需要 root 权限，且系统要有 systemd。
 > install.sh 的内置默认参数见其文件头的 `DEFAULT_ARGS`；运行时覆盖：`... | sudo bash -s -- --reality-port 8443`。
+> install.sh 也可按协议名部署（参数取文件头的 `DEFAULT_<协议>` 分组，可多选）：
+> `... | sudo bash -s -- hy2 anytls`；追加 `--xxx` 可覆盖分组默认值。
+> 卸载：`... | sudo bash -s -- uninstall`。
 
 ## 参数说明
 
@@ -53,7 +56,7 @@ runcmd:
 |---|---|---|---|
 | `SB_VERSION` | `--version` | `latest` | sing-box 版本，`latest` 表示自动取最新 release，也可指定如 `v1.14.3` |
 | `DOWNLOAD_PROXY` | `--proxy` | 空（直连） | 下载代理。两种形式都支持：`http://127.0.0.1:8080`（走 https_proxy）、`https://gh-proxy.com/`（URL 前缀镜像，国内机器推荐） |
-| `PROTOCOLS` | `--protocols` | `reality,hy2,anytls,vlesstcp` | 启用的协议，逗号分隔，见下表 |
+| `PROTOCOLS` | `--protocols` | *(空)* | 启用的协议，逗号分隔，见下表。默认不建任何节点（只装核心），由 `install.sh` 或命令行显式指定 |
 | `NODE_NAME` | `--name` | `default` | 节点备注前缀 |
 | `SERVER_IP` | `--ip` | 自动检测 | 写进分享链接的服务器 IP，自动检测失败时必须手动指定 |
 | `ENABLE_BBR` | `--enable-bbr` | `true` | 是否开启 BBR 拥塞控制 |
@@ -230,7 +233,7 @@ systemd 服务：`sing-box.service`、`sb-porthopping.service`（仅 hy2 跳跃�
 
 ```bash
 sbgo list                    # 列出所有节点（协议/端口一览，原管理脚本没有此命令）
-sbgo nodes                   # 显示所有分享链接
+sbgo nodes                   # 显示所有分享链接（含后来 add 的节点，实时从 conf 生成）
 sbgo add hy2 8443 mypass     # 添加节点
 sbgo del default-hy2-8443    # 删除节点（直接删，无确认，谨慎）
 sbgo info <name>             # 查看节点信息（含 anytls，已给 vendored 管理脚本打补丁支持）
@@ -240,7 +243,7 @@ sbgo change <name> port 9443 # 修改节点参数
 sbgo status | sbgo log       # 服务管理
 sbgo restart                 # 重启服务（成功会打印确认，前台执行）
 sbgo install-mgmt          # 单独安装/重装管理脚本（下载失败时重试，不重部署、不轮换密码）
-sbgo uninstall             # 卸载（含 sb-porthopping.service 和 sbgo 快捷入口自身）
+sbgo uninstall             # 卸载（含跳跃 NAT 规则、sb-porthopping.service 和 sbgo 快捷入口自身）
 sbgo deploy --protocols hy2  # 重新部署（需显式指定，避免误触）
 ```
 
@@ -269,7 +272,7 @@ A: 通过 cloud-init `write_files` 把证书放到机器上，再传 `--tls-cert
 A: 直接重跑脚本（默认 `latest`，检测到新版本会自动下载替换并重启服务）。
 
 **Q: 如何卸载？**
-A: `sbgo uninstall` —— 会调用原管理脚本的卸载（停服务、删 `/etc/sing-box`、删 systemd 服务），并额外清理本脚本的 `sb-porthopping.service` 和 `sbgo` 快捷入口自身。
+A: `sbgo uninstall` —— 会调用原管理脚本的卸载（停服务、删 `/etc/sing-box`、删 systemd 服务），并额外清理本脚本的跳跃 NAT REDIRECT 规则（含旧跳跃段残留）、`sb-porthopping.service` 和 `sbgo` 快捷入口自身。
 
 **Q: 随机生成的密码在哪看？**
 A: `/etc/sing-box/nodes.txt` 和 `deploy-result.json` 里都有，妥善保存。
