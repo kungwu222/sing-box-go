@@ -24,10 +24,12 @@ DEFAULT_ARGS=(
     --reality-port 7443
     --reality-sni "www.icloud.com"
     --hy2-port 8443
+    --hy2-password 2kge73478g
     --hy2-hopping true
     --hy2-hopping-range 60000-62000
     --hy2-hop-interval-max 4s
     --anytls-port 9443
+    --anytls-password 2kge73478g
     --anytls-sni "www.bing.com"
     --vmesstcp-port 10443
 )
