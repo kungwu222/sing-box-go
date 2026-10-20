@@ -86,13 +86,13 @@ runcmd:
 | `REALITY_SNI` | `--reality-sni` | `www.icloud.com` | REALITY 握手 SNI |
 | `HY2_PORT` | `--hy2-port` | `8443` | Hysteria2 主端口（UDP） |
 | `HY2_HOPPING` | `--hy2-hopping` | `true` | 是否启用端口跳跃 |
-| `HY2_HOPPING_RANGE` | `--hy2-hopping-range` | `20000-50000` | 跳跃端口段 |
+| `HY2_HOPPING_RANGE` | `--hy2-hopping-range` | `60000-64000` | 跳跃端口段 |
 | `HY2_HOP_INTERVAL` | `--hy2-hop-interval` | `30s` | 客户端跳跃间隔（sing-box 原生字段） |
 | `HY2_HOP_INTERVAL_MAX` | `--hy2-hop-interval-max` | 空 | 客户端跳跃间隔上限（随机跳跃，空=不启用，需 sing-box ≥1.14） |
 | `ANYTLS_PORT` | `--anytls-port` | `9443` | AnyTLS 端口 |
 | `ANYTLS_SNI` | `--anytls-sni` | `www.bing.com` | AnyTLS 的 TLS SNI（自签证书场景，仅作标识） |
 | `VLESSTCP_PORT` | `--vlesstcp-port` | `18090` | VLESS 明文 TCP 端口 |
-| `TUIC_PORT` | `--tuic-port` | `24443` | TUIC 端口（UDP） |
+| `TUIC_PORT` | `--tuic-port` | `18093` | TUIC 端口（UDP，需在 hy2 跳跃段之外） |
 | `VMESSTCP_PORT` | `--vmesstcp-port` | `18091` | VMess TCP 端口 |
 | `VMESSQUIC_PORT` | `--vmessquic-port` | `18092` | VMess QUIC 端口（UDP） |
 | `TROJAN_PORT` | `--trojan-port` | `10443` | Trojan 端口 |
@@ -117,7 +117,7 @@ runcmd:
 | `hy2` | Hysteria2（+端口跳跃） | 8443/udp | 自签证书，客户端 `insecure=1` |
 | `anytls` | AnyTLS | 9443/tcp | 自签证书 |
 | `vlesstcp` | VLESS 明文 TCP | 18090/tcp | 建议仅内网/调试用 |
-| `tuic` | TUIC v5 | 24443/udp | 自签证书 |
+| `tuic` | TUIC v5 | 18093/udp | 自签证书 |
 | `vmesstcp` | VMess TCP | 18091/tcp | |
 | `vmessquic` | VMess QUIC | 18092/udp | 自签证书 |
 | `trojan` | Trojan | 10443/tcp | 自签证书 |
@@ -176,12 +176,15 @@ runcmd:
   `iptables/nftables` 规则，把 `HY2_HOPPING_RANGE` 段的 UDP 流量重定向到 `HY2_PORT`，
   并通过 systemd 服务（`sb-porthopping.service`）保证重启后规则还在。
 - **客户端（sing-box 原生）**：脚本生成 `${NODE_NAME}-hy2-client.json`，
-  使用官方字段 `server_ports: ["20000:50000"]` + `hop_interval: "30s"`
+  使用官方字段 `server_ports: ["60000:64000"]` + `hop_interval: "30s"`
   （注意：`server_ports` 与 `server_port` 互斥，范围用冒号分隔——这是官方文档的要求）。
 - **客户端（通用）**：分享链接自带 `mport` 参数，
-  `hy2://密码@IP:8443?insecure=1&mport=20000-50000#备注`，
+  `hy2://密码@IP:8443?insecure=1&mport=60000-64000#备注`，
   v2rayNG / NekoBox / Shadowrocket 可直接导入。
 - 关闭跳跃：`--hy2-hopping false`（此时只用单端口）。
+- **注意**：跳跃段内**所有** UDP 端口都会被重定向到 hy2 端口——不要在该段内再跑其他 UDP 服务
+  （如 `sbgo add tuic` 的随机端口若落进段内会被劫持，连不上）。2026-10-20 起，
+  每次部署会自动清理指向 hy2 端口的**旧跳跃段**遗留规则，换段不再残留。
 
 ## AnyTLS 说明
 
@@ -220,7 +223,9 @@ systemd 服务：`sing-box.service`、`sb-porthopping.service`（仅 hy2 跳跃�
   （注意 raw.githubusercontent.com 有 CDN 缓存，推送后等几分钟或 URL 加 `?t=` 破缓存；
   如需给管理脚本打补丁——已内置：anytls/vlesstcp 的 `info`/`url` 支持、hy2 链接的 `mport`
   跳跃段（`hy2://` scheme + 真实 tag）、带空格文件名的引用修复、`restart`/`start`/`stop`
-  前台执行+成功确认输出、`qr` 默认 UTF8 半尺寸——改完 `src/core.sh` 后重新打包）
+  前台执行+成功确认输出、`qr` 默认 UTF8 半尺寸、链接节点名取 inbound tag（reality/vmess 等
+  不再显示 `default`）、`get_port` 随机端口避开 hy2 跳跃段（含旧段残留）——改完
+  `src/core.sh` 后重新打包）
 - 想彻底不用它：`--install-mgmt false`（或 `MGMT_URL` 设为空）
 
 ```bash
@@ -252,7 +257,7 @@ sbgo deploy --protocols hy2  # 重新部署（需显式指定，避免误触）
 A: 传 `--proxy https://gh-proxy.com/`（或你自建的 gh-proxy）。也支持标准 http/socks5 代理形式，如 `--proxy http://127.0.0.1:8080`。
 
 **Q: 云厂商安全组要放行哪些端口？**
-A: 按启用的协议放行上表端口。hy2 跳跃还要放行 `HY2_HOPPING_RANGE` 的 UDP 段（如 20000-50000/udp）。脚本的 `OPEN_FIREWALL` 只处理机器内部防火墙，**云安全组必须手动放行**。
+A: 按启用的协议放行上表端口。hy2 跳跃还要放行 `HY2_HOPPING_RANGE` 的 UDP 段（如 60000-64000/udp）。脚本的 `OPEN_FIREWALL` 只处理机器内部防火墙，**云安全组必须手动放行**。
 
 **Q: 443 端口被占用怎么办？**
 A: `--reality-port 8443` 换个端口即可（注意同步改云安全组）。
