@@ -928,6 +928,10 @@ cmd_install_mgmt() { # 单独安装/重装管理脚本 (不重部署、不轮换
 }
 
 cmd_uninstall() { # 卸载: 转发给管理脚本 (缺失时走手动流程) + 清理本脚本的附加项
+    # 先记下跳跃目标端口 (卸载后 hy2-hopping.sh 可能被删掉)
+    local hop_to=""
+    [[ -f "$SB_DIR/hy2-hopping.sh" ]] && hop_to=$(sed -n 's/^TO=\([0-9]*\)/\1/p' "$SB_DIR/hy2-hopping.sh")
+    [[ -z "$hop_to" ]] && hop_to="$HY2_PORT"
     if [[ -x "$MGMT_BIN" ]]; then
         "$MGMT_BIN" uninstall "$@"
     else
@@ -947,6 +951,21 @@ cmd_uninstall() { # 卸载: 转发给管理脚本 (缺失时走手动流程) + �
         systemctl daemon-reload 2>/dev/null || true
         ok "sb-porthopping.service removed"
     fi
+    # 删掉 hy2 跳跃的 nat REDIRECT 规则: 服务只管开机重加, 活的规则必须手动清;
+    # 顺带清掉指向同一 hy2 端口的旧跳跃段残留
+    local _ipt _line _n=0
+    for _ipt in iptables ip6tables; do
+        command -v "$_ipt" >/dev/null 2>&1 || continue
+        while IFS= read -r _line; do
+            case "$_line" in
+                *"-p udp"*) "$_ipt" -t nat -D ${_line#-A } 2>/dev/null && _n=$((_n+1)) ;;
+            esac
+        done < <("$_ipt" -t nat -S PREROUTING 2>/dev/null | grep -- "--to-ports $hop_to")
+    done
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+    [[ $_n -gt 0 ]] && ok "hy2 hopping NAT rules removed ($_n)" || log "no hy2 hopping NAT rules found"
     if [[ -L /usr/local/bin/sbgo ]]; then
         rm -f /usr/local/bin/sbgo
         ok "sbgo shortcut removed"
