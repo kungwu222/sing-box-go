@@ -20,7 +20,7 @@
 # ---------------- 1. 参数定义 (环境变量名|命令行参数|默认值) ----------------
 PARAM_DEFS="SB_VERSION|version|latest
 DOWNLOAD_PROXY|proxy|
-PROTOCOLS|protocols|reality,hy2,anytls,vlesstcp
+PROTOCOLS|protocols|
 NODE_NAME|name|default
 SERVER_IP|ip|
 UUID|uuid|
@@ -581,7 +581,20 @@ add_direct() {
 }
 
 deploy_protocols() {
-    [[ -z "$PROTOCOLS" ]] && die "PROTOCOLS is empty"
+    # 默认不建任何节点: 协议集完全由调用方控制 (install.sh 的 DEFAULT_ARGS 或 --protocols)
+    if [[ -z "$PROTOCOLS" ]]; then
+        warn "PROTOCOLS is empty: core-only deploy (no nodes). Add nodes later via sbgo add, or pass --protocols"
+        return 0
+    fi
+    # 前置校验: 协议名写错当场报参数错误, 免得部署完才发现零节点
+    local _supported="reality hy2 anytls vlesstcp tuic vmesstcp vmessquic trojan ss socks vlessws vmessws trojws direct" _bad="" _p
+    for _p in ${PROTOCOLS//,/ }; do
+        case "${_p,,}" in
+            reality|hy2|hysteria2|anytls|vlesstcp|tuic|vmesstcp|vmessquic|trojan|ss|shadowsocks|socks|vlessws|vmessws|trojws|trojanws|direct) ;;
+            *) _bad+=" $_p" ;;
+        esac
+    done
+    [[ -n "$_bad" ]] && die "unknown protocol(s):$_bad | supported: $_supported | aliases: hysteria2=hy2, shadowsocks=ss, trojanws=trojws"
     # 跳跃段内的 UDP 流量会被 REDIRECT 到 hy2 端口: UDP 协议端口落在段内会直接被劫持, 部署前拦截
     if is_true "$HY2_HOPPING" && grep -qi "hy2" <<<"$PROTOCOLS"; then
         local hs="${HY2_HOPPING_RANGE%-*}" he="${HY2_HOPPING_RANGE#*-}" _pp _pn
@@ -612,7 +625,7 @@ deploy_protocols() {
             *) warn "unknown protocol '$p', skipped" ;;
         esac
     done
-    [[ ${#NODES_JSON[@]} -eq 0 ]] && die "no protocol was deployed, check PROTOCOLS"
+    [[ ${#NODES_JSON[@]} -eq 0 ]] && die "no nodes were created: every requested protocol was skipped (see warnings above, e.g. WS-TLS protocols need --tls-cert/--tls-key/--ws-host)"
     ok "protocols deployed: ${#NODES_JSON[@]} node(s)"
 }
 
