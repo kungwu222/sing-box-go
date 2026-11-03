@@ -8,8 +8,10 @@
 - **AnyTLS**：原生支持（原仓库没有）
 - **全协议保留**：原仓库支持的 14 种协议全部可用，每个参数都有默认值、可外部覆盖
 - **管理脚本可选捆绑**：可顺手装上原仓库的 `sing-box` 管理命令（add/info/url/del…）
-- **配置校验**：生成后用官方 `sing-box check` 校验，失败直接报错退出，不会留下半吊子服务
-- **`--dry-run` 预演模式**：不碰系统，先验证配置和参数
+- **端口占用检查**：按 TCP / UDP 检查 IPv4 / IPv6 端口；其他服务占用时跳过该协议并报告错误，其余协议继续部署
+- **配置校验与回滚**：服务端及生成的客户端配置均用官方 `sing-box check` 校验；安装或启动失败时恢复原配置、证书、二进制和服务状态
+- **下载校验**：核心使用 GitHub release 的 SHA256 digest；部署脚本和管理包使用仓库内的 `.sha256` 清单，校验后再执行或解包
+- **`--dry-run` 预演模式**：只在临时目录生成、下载和校验，不安装依赖、不修改系统服务
 
 ## 快速开始
 
@@ -21,7 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/ma
 curl -fsSL https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/auto-deploy.sh -o /root/auto-deploy.sh
 chmod +x /root/auto-deploy.sh
 /root/auto-deploy.sh --dry-run   # 先预演（推荐）
-/root/auto-deploy.sh             # 正式部署（默认：reality + hy2 + anytls + vlesstcp）
+/root/auto-deploy.sh --protocols reality,hy2,anytls,vmesstcp
+# 不传 --protocols 时仅安装核心，不创建节点
 
 # 查看节点
 cat /etc/sing-box/nodes.txt
@@ -32,6 +35,10 @@ cat /etc/sing-box/nodes.txt
 > install.sh 也可按协议名部署（参数取文件头的 `DEFAULT_<协议>` 分组，可多选）：
 > `... | sudo bash -s -- hy2 anytls`；追加 `--xxx` 可覆盖分组默认值。
 > 卸载：`... | sudo bash -s -- uninstall`。
+
+`install.sh` 的默认协议集是 **reality + hy2 + anytls + vmesstcp**，对应端口为
+**7443/tcp、8443/udp、9443/tcp、10443/tcp**。它继续使用文件头的共享 UUID、密码默认值。
+直接调用 `auto-deploy.sh` 时，未指定的凭证按下表随机生成。
 
 ## 参数说明
 
@@ -46,8 +53,7 @@ PROTOCOLS=reality,hy2 HY2_PORT=8443 ./auto-deploy.sh
 
 # cloud-init 里
 runcmd:
-  - export PROTOCOLS=reality,hy2,anytls DOWNLOAD_PROXY=https://gh-proxy.com/
-  - /root/auto-deploy.sh
+  - PROTOCOLS=reality,hy2,anytls DOWNLOAD_PROXY=https://gh-proxy.com/ /root/auto-deploy.sh
 ```
 
 ### 全局参数
@@ -63,8 +69,12 @@ runcmd:
 | `OPEN_FIREWALL` | `--open-firewall` | `true` | 是否自动放行相关端口（ufw / firewalld / iptables，尽力而为） |
 | `INSTALL_MGMT` | `--install-mgmt` | `true` | 是否安装原仓库管理脚本（`sing-box` / `sb` 命令） |
 | `MGMT_URL` | `--mgmt-url` | 你自己 git 仓库的 `mgmt-code.tar.gz` | 管理脚本 tarball 下载地址；设为空则不下载 |
+| `MGMT_SHA256_URL` | `--mgmt-sha256-url` | `${MGMT_URL}.sha256` | 管理包的 SHA256 清单地址；自定义管理包需提供对应清单 |
 | `DRY_RUN` | `--dry-run` | `false` | 预演模式：只生成+校验配置，不修改系统 |
 | `FORCE` | `--force` | `false` | 强制重新下载安装（即使已是目标版本） |
+
+字符串和数字参数必须提供值。显式留空可用 `--protocols=`、`--mgmt-url=` 等写法；
+布尔参数支持 `--dry-run` 这样的无值简写。
 
 ### 凭证参数（不传则随机生成）
 
@@ -134,7 +144,7 @@ runcmd:
 ## 使用示例
 
 ```bash
-# 默认部署
+# 仅安装核心
 ./auto-deploy.sh
 
 # 只部署 hy2（带跳跃）
@@ -185,13 +195,16 @@ runcmd:
   `hy2://密码@IP:8443?insecure=1&mport=60000-64000#备注`，
   v2rayNG / NekoBox / Shadowrocket 可直接导入。
 - 关闭跳跃：`--hy2-hopping false`（此时只用单端口）。
+- `install.sh` 的默认随机跳跃区间为 **2s–4s**；直接调用部署脚本时仍默认固定 `30s`。
+  `hop_interval_max` 需要客户端核心支持该字段（sing-box ≥ 1.14），上限不能小于下限。
 - **注意**：跳跃段内**所有** UDP 端口都会被重定向到 hy2 端口——不要在该段内再跑其他 UDP 服务
-  （如 `sbgo add tuic` 的随机端口若落进段内会被劫持，连不上）。2026-10-20 起，
-  每次部署会自动清理指向 hy2 端口的**旧跳跃段**遗留规则，换段不再残留。
+  （如其他 UDP 服务落在该段内会被重定向）。部署前也会检查该段是否有其他进程占用。
+  新规则使用独立的 `SB_HY2_HOP` 链或 `inet sb_hy2_hop` 表；重新部署会清理之前的跳跃规则，
+  移除、关闭或跳过 Hy2 时也会移除其持久化服务。
 
 ## AnyTLS 说明
 
-- 入站类型 `anytls`（需 sing-box ≥ 1.11，脚本默认装最新版），自签证书。
+- 入站类型 `anytls`，脚本默认装最新版，自签证书；所选核心必须支持该入站类型。
 - 分享链接：`anytls://密码@IP:9443?sni=www.bing.com&insecure=1#备注`
 - 客户端要求：NekoBox / Shadowrocket / v2rayNG（需较新版本）等支持 AnyTLS 的客户端。
 
@@ -219,22 +232,24 @@ systemd 服务：`sing-box.service`、`sb-porthopping.service`（仅 hy2 跳跃�
 ### 管理脚本来源（vendored，不再直连上游）
 
 `sbgo add/del/info/url` 等命令转发给原仓库的管理脚本。它的 tarball 已打包为 **`mgmt-code.tar.gz`**
-（38KB，GPLv3），**提交到你自己的 git 仓库**（与 `auto-deploy.sh` 同目录），部署时从 `MGMT_URL`
+（GPLv3），**提交到你自己的 git 仓库**（与 `auto-deploy.sh` 同目录），部署时从 `MGMT_URL`
 下载——不再从上游 `ooplastone22/sing-box` 的 releases 拉取：
 
-- 更新管理脚本版本时：重新下载上游 `code.tar.gz`，覆盖掉你仓库里的 `mgmt-code.tar.gz` 并推送
-  （注意 raw.githubusercontent.com 有 CDN 缓存，推送后等几分钟或 URL 加 `?t=` 破缓存；
-  如需给管理脚本打补丁——已内置：anytls/vlesstcp 的 `info`/`url` 支持、hy2 链接的 `mport`
-  跳跃段（`hy2://` scheme + 真实 tag）、带空格文件名的引用修复、`restart`/`start`/`stop`
-  前台执行+成功确认输出、`qr` 默认 UTF8 半尺寸、链接节点名取 inbound tag（reality/vmess 等
-  不再显示 `default`）、`get_port` 随机端口避开 hy2 跳跃段（含旧段残留）——改完
-  `src/core.sh` 后重新打包）
+- 可审查的源代码位于 **`mgmt/`**。修改后运行 `python scripts/build-artifacts.py`，
+  生成确定性的 `mgmt-code.tar.gz`，并更新它和 `auto-deploy.sh` 的 SHA256 清单。
+- 发布时将脚本、管理包和两个 `.sha256` 文件一起推送。下载内容与清单不一致会报错，
+  并保留已安装的管理包。
+- `sbgo U` / `sb u sh` 通过 `sbgo install-mgmt` 更新本仓库的管理包，保留本地协议修复。
+- 已支持 AnyTLS 和 VLESS TCP 的添加、编辑、信息及链接输出；编辑先校验，启动失败则回滚。
+- `sb reinstall` 重新安装已校验的管理包，保留核心和节点；完整替换节点仍使用 `sbgo deploy`。
 - 想彻底不用它：`--install-mgmt false`（或 `MGMT_URL` 设为空）
 
 ```bash
 sbgo list                    # 列出所有节点（协议/端口一览，原管理脚本没有此命令）
 sbgo nodes                   # 显示所有分享链接（含后来 add 的节点，实时从 conf 生成）
 sbgo add hy2 8443 mypass     # 添加节点
+sbgo add anytls 9443 mypass  # 添加 AnyTLS
+sbgo add vlesstcp 18090      # 添加明文 VLESS TCP
 sbgo del default-hy2-8443    # 删除节点（直接删，无确认，谨慎）
 sbgo info <name>             # 查看节点信息（含 anytls，已给 vendored 管理脚本打补丁支持）
 sbgo url <name>              # 输出分享链接
@@ -254,6 +269,23 @@ sbgo deploy --protocols hy2  # 重新部署（需显式指定，避免误触）
 - **安全设计**：`sbgo` 无参数时只显示帮助，**不会**触发部署（重跑部署会重新随机生成密码，误触代价大）；想重部署必须显式写 `sbgo deploy`
 - 如果部署时 `INSTALL_MGMT=false`，`add/del` 等转发类命令不可用（会明确报错），`list`/`nodes` 不受影响
 
+## 占用端口与重新部署
+
+- 其他进程占用协议端口时，输出 `[ERR] skipping <协议>: <传输层、端口及进程信息>`，
+  跳过该协议；Shadowsocks 和端口转发会检查 TCP、UDP 两种传输。
+- 当前由本机 `sing-box.service` 管理的核心进程占用的端口可用于重新部署。
+  `netstat` 回退模式通过 root 权限下的 `fuser` 确认全部持有者；无法确认时保守跳过，并提示使用 `ss` 或安装 `fuser`（psmisc）。
+- 两个选定协议需要同一传输层、同一端口时，按选择顺序保留第一个，跳过后一个。
+- 至少成功生成一个节点时允许部分部署，跳过原因写入 `deploy-result.json` 的 `skipped` 数组
+  以及 `nodes.txt`。非空协议集全部被跳过时，退出码非零，保留原安装和结果文件。
+- **成功重新部署会删除所有旧节点**，包括 `sbgo add` 添加的节点，安装本次成功选定的节点。
+  配置校验失败不替换现有文件；安装或服务启动失败会恢复备份。
+- 预演需要事先安装 `curl`、`tar`、`openssl`、`jq`，以及 `ss`（iproute2 / iproute）或
+  `netstat`（net-tools）。正式部署会安装缺失依赖，管理命令还需要 `wget`，二维码需要 `qrencode`。
+  已部署服务器上以 root 预演可以识别本机 sing-box 的端口归属。
+- 管理命令修改 Hy2 主端口时，会同步跳跃目标、部署元数据及客户端密码；删除对应节点时清理跳跃服务和客户端文件。
+  同步失败会恢复旧节点和旧跳跃状态。节点与二进制更新会等待服务稳定启动，再删除备份。
+
 ## FAQ
 
 **Q: 国内机器 GitHub 下载慢/失败？**
@@ -269,7 +301,9 @@ A: `--reality-port 8443` 换个端口即可（注意同步改云安全组）。
 A: 通过 cloud-init `write_files` 把证书放到机器上，再传 `--tls-cert /path/fullchain.pem --tls-key /path/privkey.pem --ws-host 你的域名`。
 
 **Q: 如何更新 sing-box 到新版本？**
-A: 直接重跑脚本（默认 `latest`，检测到新版本会自动下载替换并重启服务）。
+A: `sbgo u core` 更新核心并校验现有配置，保留节点；显式版本可用 `sbgo u core v1.14.3`。
+下载需能访问 GitHub API 的 SHA256 元数据，启动失败会恢复原二进制。重新部署使用
+`sbgo deploy --protocols ...`，成功后按上一节说明替换旧节点。
 
 **Q: 如何卸载？**
 A: `sbgo uninstall` —— 会调用原管理脚本的卸载（停服务、删 `/etc/sing-box`、删 systemd 服务），并额外清理本脚本的跳跃 NAT REDIRECT 规则（含旧跳跃段残留）、`sb-porthopping.service` 和 `sbgo` 快捷入口自身。
@@ -283,4 +317,46 @@ A: `/etc/sing-box/nodes.txt` 和 `deploy-result.json` 里都有，妥善保存�
 2. 自签证书的协议（hy2/tuic/trojan/anytls/vmess-quic）客户端需开启"跳过证书验证"（`insecure`/`allowInsecure`），分享链接已默认带上。
 3. `sb-porthopping.service` 依赖 iptables/nftables，极简镜像请确保其一可用（脚本会尝试自动安装 iptables）。
 4. `sbgo qr` 需要 `qrencode`，装管理脚本时会自动安装（apt/yum/dnf）。
-5. 部署后建议先用 `--dry-run` 在同类机器上验证参数，再批量推 cloud-init。
+5. 批量部署前，先在同类机器上用 `--dry-run` 验证参数；生成的服务端及 Hy2 客户端配置均会校验。
+
+## 发布到仓库
+
+发布源码仓库时，请同时保留以下目录：
+
+- **`mgmt/`**：可审查、可修改的管理脚本源码，用于生成管理包。
+- **`scripts/`**：包含 `build-artifacts.py`，用于重建归档和 SHA256 清单。
+- **`tests/`**：回归测试，供本地验证和 CI 使用。
+- **`.github/workflows/`**：GitHub Actions 配置，运行测试、语法和产物一致性检查。
+
+用于服务器部署的仓库根目录文件为：
+
+```text
+install.sh
+auto-deploy.sh
+auto-deploy.sh.sha256
+mgmt-code.tar.gz
+mgmt-code.tar.gz.sha256
+```
+
+服务器安装过程不会单独下载 `mgmt/`、`scripts/` 或测试目录；管理脚本从
+`mgmt-code.tar.gz` 解包安装。这些源码目录仍应发布到仓库，以便后续维护和 CI 检查。
+
+发布前运行：
+
+```bash
+python scripts/build-artifacts.py
+python scripts/build-artifacts.py --check
+```
+
+请将源码目录、部署脚本、重新生成的管理包和两个 `.sha256` 清单一起发布。
+
+## 开发与验证
+
+```bash
+python scripts/build-artifacts.py          # 修改部署脚本或 mgmt/ 后更新发行产物
+python scripts/build-artifacts.py --check  # 检查归档和清单是否与源代码一致
+python -m unittest discover -s tests -v    # Bash/jq 隔离回归测试
+```
+
+测试使用临时目录及服务/网络命令替身，不在开发主机上实际部署。Linux CI 运行回归测试、
+所有脚本的 Bash 语法检查以及产物一致性检查；实际 systemd、防火墙和协议连通性需在 Linux 主机上验证。

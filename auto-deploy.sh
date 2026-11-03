@@ -63,6 +63,7 @@ ENABLE_BBR|enable-bbr|true
 OPEN_FIREWALL|open-firewall|true
 INSTALL_MGMT|install-mgmt|true
 MGMT_URL|mgmt-url|https://raw.githubusercontent.com/kungwu222/sing-box-go/refs/heads/main/mgmt-code.tar.gz
+MGMT_SHA256_URL|mgmt-sha256-url|
 DRY_RUN|dry-run|false
 FORCE|force|false
 "
@@ -76,6 +77,7 @@ SB_BIN="$SB_DIR/bin/sing-box"
 CONF_DIR="$SB_DIR/conf"
 SH_DIR="$SB_DIR/sh"
 LOG_DIR="/var/log/sing-box"
+SYSTEMD_DIR="/lib/systemd/system"
 
 declare -A CLI_MAP
 
@@ -86,6 +88,10 @@ warn() { log "\e[33m[WARN]\e[0m $*"; }
 die()  { log "\e[31m[ERR]\e[0m $*" >&2; exit 1; }
 
 is_true() { case "${1,,}" in true|1|yes|y) return 0 ;; *) return 1 ;; esac; }
+is_boolean_option() {
+    case "$1" in enable-bbr|open-firewall|install-mgmt|dry-run|force|hy2-hopping) return 0 ;; *) return 1 ;; esac
+}
+is_boolean_value() { case "${1,,}" in true|false|1|0|yes|no|y|n|"") return 0 ;; *) return 1 ;; esac; }
 
 usage() {
     echo "Usage:"
@@ -149,19 +155,28 @@ parse_args() {
                 local k="${1#--}"
                 local var="${CLI_MAP[$k]:-}"
                 [[ -z "$var" ]] && die "unknown option: --$k (see --help)"
-                if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then
+                if [[ $# -ge 2 && "${2:0:2}" != "--" ]]; then
                     printf -v "$var" '%s' "$2"; shift 2
-                else
+                elif is_boolean_option "$k"; then
                     printf -v "$var" '%s' "true"; shift
+                else
+                    die "--$k requires a value (use --$k= for an explicit empty value)"
                 fi ;;
             *) die "unknown argument: $1 (see --help)" ;;
         esac
     done
+    local var cli def
+    while IFS='|' read -r var cli def; do
+        [[ -n "$var" ]] || continue
+        if is_boolean_option "$cli" && ! is_boolean_value "${!var}"; then
+            die "--$cli / $var requires a boolean value (true/false, yes/no, 1/0)"
+        fi
+    done <<< "$PARAM_DEFS"
 }
 
 # ---------------- 3. 环境检查 ----------------
 preflight() {
-    [[ $EUID -ne 0 && "$DRY_RUN" != "true" ]] && die "must run as root (or use --dry-run)"
+    [[ $EUID -ne 0 ]] && ! is_true "$DRY_RUN" && die "must run as root (or use --dry-run)"
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MGR="apt-get"
     elif command -v yum >/dev/null 2>&1; then
@@ -182,6 +197,15 @@ preflight() {
 
 # ---------------- 4. 依赖安装 ----------------
 install_deps() {
+    if is_true "$DRY_RUN"; then
+        local missing="" c
+        for c in curl tar openssl jq; do command -v "$c" >/dev/null 2>&1 || missing+=" $c"; done
+        if [[ -n "$PROTOCOLS" ]] && ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
+            missing+=" ss (iproute2/iproute) or netstat (net-tools)"
+        fi
+        [[ -z "$missing" ]] || die "dry-run requires already installed tools:$missing; install them before retrying"
+        return 0
+    fi
     local need=""
     for c in curl tar openssl; do
         command -v "$c" >/dev/null 2>&1 || need="$need $c"
@@ -204,9 +228,15 @@ install_deps() {
         fi
     fi
     if ! command -v jq >/dev/null 2>&1; then
-        dl "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${ARCH}" "/usr/local/bin/jq" \
+        local jq_file="$STAGE_DIR/jq" jq_digest
+        case "$ARCH" in
+            amd64) jq_digest=5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5 ;;
+            arm64) jq_digest=4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5 ;;
+        esac
+        dl "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${ARCH}" "$jq_file" \
             || die "jq install failed"
-        chmod +x /usr/local/bin/jq
+        verify_sha256 "$jq_file" "$jq_digest" || die "jq checksum mismatch"
+        chmod +x "$jq_file" && cp -f "$jq_file" /usr/local/bin/jq || die "jq installation failed"
     fi
     # iptables (for hy2 port hopping / firewall)
     if ! command -v iptables >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then
@@ -217,6 +247,11 @@ install_deps() {
             $PKG_MGR install -y -q iptables 2>/dev/null || true
         fi
     fi
+    if [[ -n "$PROTOCOLS" ]] && ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
+        local socket_package=iproute
+        [[ "$PKG_MGR" == apt-get ]] && socket_package=iproute2
+        $PKG_MGR install -y "$socket_package" || die "cannot install socket inspection tool: $socket_package"
+    fi
     ok "dependencies ready"
 }
 
@@ -225,24 +260,49 @@ DL_PREFIX=""
 dl_init() {
     [[ -z "$DOWNLOAD_PROXY" ]] && return 0
     case "$DOWNLOAD_PROXY" in
-        */|*gh-proxy*|*ghproxy*|*mirror*|*proxy*)
-            DL_PREFIX="$DOWNLOAD_PROXY"
+        http://*|socks4://*|socks5://*|socks5h://*)
+            export https_proxy="$DOWNLOAD_PROXY" http_proxy="$DOWNLOAD_PROXY"
+            log "download proxy configured"
+            ;;
+        */|*gh-proxy*|*ghproxy*|*mirror*)
+            DL_PREFIX="${DOWNLOAD_PROXY%/}/"
             log "download mirror: $DL_PREFIX"
             ;;
         *)
             export https_proxy="$DOWNLOAD_PROXY" http_proxy="$DOWNLOAD_PROXY"
-            log "download proxy: $DOWNLOAD_PROXY"
+            log "download proxy configured"
             ;;
     esac
 }
 
 dl() { # dl <url> <output>
     local url="$1" out="$2"
-    if [[ -n "$DL_PREFIX" && "$url" == https://github.com/* ]]; then
+    if [[ -n "$DL_PREFIX" && ( "$url" == https://github.com/* || "$url" == https://raw.githubusercontent.com/* ) ]]; then
         url="${DL_PREFIX}${url}"
     fi
     log "download: $url"
     curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o "$out" "$url"
+}
+
+verify_sha256() {
+    local digest
+    [[ "$2" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    digest=$(openssl dgst -sha256 "$1" 2>/dev/null) || return 1
+    [[ "${digest##* }" == "${2,,}" ]]
+}
+
+manifest_hash() { # manifest filename
+    awk -v name="$2" '$2 == name || $2 == "*" name || NF == 1 { print $1; exit }' "$1"
+}
+
+validate_archive() {
+    local entry listing
+    listing=$(tar tzf "$1") || return 1
+    while IFS= read -r entry; do
+        [[ "$entry" != /* && "$entry" != *\\* && "/$entry/" != *"/../"* && "$entry" != [[:alpha:]]:* ]] || return 1
+    done <<<"$listing"
+    listing=$(tar tvzf "$1") || return 1
+    ! grep -qE '^[lh]' <<<"$listing"
 }
 
 resolve_version() {
@@ -264,7 +324,7 @@ resolve_version() {
 download_binary() {
     local ver="${SB_VERSION#v}"
     local installed=""
-    [[ -x "$SB_BIN" ]] && installed=$("$SB_BIN" version 2>/dev/null | awk '{print $3}')
+    [[ -x "$SB_BIN" ]] && installed=$("$SB_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
     if [[ "v$installed" == "$SB_VERSION" ]] && ! is_true "$FORCE"; then
         log "sing-box $SB_VERSION already installed, skip download"
         STAGE_BIN="$SB_BIN"
@@ -273,6 +333,14 @@ download_binary() {
     local url="https://github.com/${SB_REPO}/releases/download/${SB_VERSION}/sing-box-${ver}-linux-${ARCH}.tar.gz"
     local tmp="$STAGE_DIR/sing-box.tar.gz"
     dl "$url" "$tmp" || die "sing-box download failed"
+    local metadata="$STAGE_DIR/release.json" digest
+    # Fetch metadata over verified GitHub HTTPS, independently of artifact mirrors.
+    dl "https://api.github.com/repos/$SB_REPO/releases/tags/$SB_VERSION" "$metadata" || die "cannot fetch release checksum metadata"
+    digest=$(jq -er --arg name "sing-box-${ver}-linux-${ARCH}.tar.gz" \
+        '.assets[] | select(.name == $name) | .digest | select(type == "string" and startswith("sha256:")) | ltrimstr("sha256:")' "$metadata") \
+        || die "release has no published SHA256 checksum for this binary"
+    verify_sha256 "$tmp" "$digest" || die "sing-box checksum mismatch"
+    validate_archive "$tmp" || die "unsafe sing-box archive"
     mkdir -p "$STAGE_DIR/pkg"
     tar xzf "$tmp" --strip-components 1 -C "$STAGE_DIR/pkg" || die "extract failed"
     [[ -x "$STAGE_DIR/pkg/sing-box" ]] || die "sing-box binary not found in package"
@@ -329,14 +397,161 @@ gen_crypto() {
 # ---------------- 9. 配置生成 ----------------
 TCP_PORTS=(); UDP_PORTS=()
 NODES_JSON=()
+DEPLOY_PROTOCOLS=(); SKIPPED_JSON=(); PORT_CLAIMS=()
+
+valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
+
+snapshot_listeners() {
+    MANAGED_PID=$(systemctl show -p MainPID --value sing-box.service 2>/dev/null) || MANAGED_PID=""
+    local exe="" expected="$SB_BIN"
+    if [[ "$MANAGED_PID" =~ ^[1-9][0-9]*$ ]]; then
+        exe=$(readlink -f "/proc/$MANAGED_PID/exe" 2>/dev/null) || exe=""
+        expected=$(readlink -f "$SB_BIN" 2>/dev/null) || expected="$SB_BIN"
+        [[ "${exe% (deleted)}" == "$expected" ]] || MANAGED_PID=""
+    else
+        MANAGED_PID=""
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        SOCKET_TOOL=ss
+        LISTENERS_TCP=$(ss -H -ltnp 2>/dev/null) || die "cannot inspect TCP ports with ss"
+        LISTENERS_UDP=$(ss -H -aunp 2>/dev/null) || die "cannot inspect UDP ports with ss"
+    elif command -v netstat >/dev/null 2>&1; then
+        SOCKET_TOOL=netstat
+        local rows
+        rows=$(netstat -antup 2>/dev/null) || die "cannot inspect ports with netstat"
+        LISTENERS_TCP=$(awk '$1 ~ /^tcp/ && $6 == "LISTEN" {print}' <<<"$rows")
+        LISTENERS_UDP=$(awk '$1 ~ /^udp/ {print}' <<<"$rows")
+    else
+        die "cannot inspect ports: install iproute2 (ss) or net-tools (netstat)"
+    fi
+}
+
+socket_is_managed() {
+    OWNERSHIP_UNCERTAIN=false; SOCKET_OWNERS=""
+    [[ -n "$MANAGED_PID" ]] || return 1
+    local row="$1" pids pid
+    if [[ "$SOCKET_TOOL" == ss ]]; then
+        pids=$(grep -oE 'pid=[0-9]+' <<<"$row" | cut -d= -f2)
+        [[ -n "$pids" ]] || return 1
+        [[ $(grep -oE '"[^"]*"' <<<"$row" | wc -l) -eq $(wc -w <<<"$pids") ]] || return 1
+    else
+        pid=$(awk '{print $NF}' <<<"$row")
+        pids="${pid%%/*}"
+        [[ "$pids" =~ ^[1-9][0-9]*$ ]] || return 1
+        [[ "$pids" == "$MANAGED_PID" ]] || return 1
+        # netstat reports a single process, not every holder of a shared socket.
+        # Root fuser supplies the all-owner inventory needed for an exemption.
+        if [[ $(id -u) != 0 ]] || ! command -v fuser >/dev/null 2>&1; then
+            OWNERSHIP_UNCERTAIN=true; return 1
+        fi
+        pids=$(fuser -n "$2" "$3" 2>/dev/null) || { OWNERSHIP_UNCERTAIN=true; return 1; }
+        [[ -n "$pids" ]] || { OWNERSHIP_UNCERTAIN=true; return 1; }
+        SOCKET_OWNERS="$pids"
+    fi
+    for pid in $pids; do [[ "$pid" == "$MANAGED_PID" ]] || return 1; done
+    return 0
+}
+
+check_protocol_port() { # protocol transport port-or-range
+    local protocol="$1" transport="$2" range="$3" start="${3%-*}" end="${3#*-}"
+    local claim ct cs ce owner row endpoint port rows
+    valid_port "$start" && valid_port "$end" && (( start <= end )) \
+        || die "invalid $protocol $transport port/range: $range (expected 1-65535)"
+    for claim in "${PORT_CLAIMS[@]}"; do
+        IFS='|' read -r ct cs ce owner <<<"$claim"
+        if [[ "$ct" == "$transport" ]] && (( start <= ce && end >= cs )); then
+            PORT_CONFLICT="$transport $range conflicts with selected protocol $owner"
+            return 1
+        fi
+    done
+    [[ "$transport" == tcp ]] && rows="$LISTENERS_TCP" || rows="$LISTENERS_UDP"
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        endpoint=$(awk '{print $4}' <<<"$row"); port="${endpoint##*:}"
+        [[ "$port" =~ ^[0-9]+$ ]] || die "cannot inspect socket endpoint: $row"
+        if (( port >= start && port <= end )) && ! socket_is_managed "$row" "$transport" "$port"; then
+            PORT_CONFLICT="$transport $range is occupied at $endpoint: $row"
+            [[ -z "$SOCKET_OWNERS" ]] || PORT_CONFLICT+="; owners: $SOCKET_OWNERS"
+            if is_true "$OWNERSHIP_UNCERTAIN"; then PORT_CONFLICT+="; cannot confirm all owners (use ss or root with fuser)"; fi
+            return 1
+        fi
+    done <<<"$rows"
+    return 0
+}
+
+skip_protocol() {
+    log "\e[31m[ERR]\e[0m skipping $1: $2" >&2
+    SKIPPED_JSON+=("$(jq -n --arg protocol "$1" --arg reason "$2" \
+        '{protocol:$protocol,reason:$reason}')")
+}
+
+has_deployed() {
+    local protocol
+    for protocol in "${DEPLOY_PROTOCOLS[@]}"; do [[ "$protocol" == "$1" ]] && return 0; done
+    return 1
+}
+
+select_protocols() {
+    DEPLOY_PROTOCOLS=(); SKIPPED_JSON=(); PORT_CLAIMS=()
+    local p port spec transport range failed
+    local -a specs
+    local -A seen=()
+    [[ -z "$PROTOCOLS" ]] && { PROTOCOL_SELECTION_READY=true; return 0; }
+    snapshot_listeners
+    for p in ${PROTOCOLS//,/ }; do
+        p="${p,,}"
+        case "$p" in hysteria2) p=hy2 ;; shadowsocks) p=ss ;; trojanws) p=trojws ;; esac
+        [[ -n "${seen[$p]:-}" ]] && continue
+        seen[$p]=1; specs=(); failed=false
+        case "$p" in
+            reality) port="$REALITY_PORT"; specs=("tcp:$port") ;;
+            hy2) port="$HY2_PORT"; specs=("udp:$port")
+                 is_true "$HY2_HOPPING" && specs+=("udp:$HY2_HOPPING_RANGE") ;;
+            anytls) port="$ANYTLS_PORT"; specs=("tcp:$port") ;;
+            vlesstcp) port="$VLESSTCP_PORT"; specs=("tcp:$port") ;;
+            tuic) port="$TUIC_PORT"; specs=("udp:$port") ;;
+            vmesstcp) port="$VMESSTCP_PORT"; specs=("tcp:$port") ;;
+            vmessquic) port="$VMESSQUIC_PORT"; specs=("udp:$port") ;;
+            trojan) port="$TROJAN_PORT"; specs=("tcp:$port") ;;
+            ss) port="$SS_PORT"; specs=("tcp:$port" "udp:$port") ;;
+            socks) port="$SOCKS_PORT"; specs=("tcp:$port") ;;
+            vlessws|vmessws|trojws)
+                case "$p" in vlessws) port="$VLESSWS_PORT" ;; vmessws) port="$VMESSWS_PORT" ;; trojws) port="$TROJANWS_PORT" ;; esac
+                [[ -f "$TLS_CERT" && -f "$TLS_KEY" && -n "$WS_HOST" ]] \
+                    || { skip_protocol "$p" "TLS_CERT/TLS_KEY and WS_HOST are required"; continue; }
+                specs=("tcp:$port") ;;
+            direct)
+                [[ -n "$DIRECT_PORT" && -n "$DIRECT_ADDR" ]] \
+                    || { skip_protocol "$p" "DIRECT_PORT and DIRECT_ADDR are required"; continue; }
+                valid_port "${DIRECT_RPORT:-$DIRECT_PORT}" || die "invalid direct remote port"
+                specs=("tcp:$DIRECT_PORT" "udp:$DIRECT_PORT") ;;
+            *) die "unknown protocol: $p (see --help)" ;;
+        esac
+        for spec in "${specs[@]}"; do
+            transport="${spec%%:*}"; range="${spec#*:}"
+            if ! check_protocol_port "$p" "$transport" "$range"; then
+                skip_protocol "$p" "$PORT_CONFLICT"; failed=true; break
+            fi
+        done
+        is_true "$failed" && continue
+        DEPLOY_PROTOCOLS+=("$p")
+        for spec in "${specs[@]}"; do
+            range="${spec#*:}"
+            PORT_CLAIMS+=("${spec%%:*}|${range%-*}|${range#*-}|$p")
+        done
+    done
+    [[ ${#DEPLOY_PROTOCOLS[@]} -gt 0 ]] || die "no nodes were created: every requested protocol was skipped"
+    PROTOCOL_SELECTION_READY=true
+}
 
 reg_port() { # proto port
     if [[ "$1" == "tcp" ]]; then TCP_PORTS+=("$2"); else UDP_PORTS+=("$2"); fi
 }
 
 build_base_config() {
+    mkdir -p "$STAGE_DIR/log" || die "cannot create staged log directory"
     jq -n \
-        --arg logfile "$LOG_DIR/access.log" \
+        --arg logfile "$STAGE_DIR/log/access.log" \
         '{log: {output: $logfile, level: "info", timestamp: true},
           dns: {},
           ntp: {enabled: true, server: "time.apple.com"},
@@ -575,6 +790,7 @@ add_direct() {
         '{inbounds:[{tag:$tag,type:"direct",listen:"::",listen_port:$port,
             override_address:$addr,override_port:$rport}]}' > "$f"
     reg_port tcp "$DIRECT_PORT"
+    reg_port udp "$DIRECT_PORT"
     NODES_JSON+=("$(jq -n --arg p direct --argjson port "$DIRECT_PORT" --arg addr "$DIRECT_ADDR" \
         --argjson rport "${DIRECT_RPORT:-$DIRECT_PORT}" \
         '{protocol:$p,port:$port,remote_addr:$addr,remote_port:$rport,url:null}')")
@@ -586,27 +802,8 @@ deploy_protocols() {
         warn "PROTOCOLS is empty: core-only deploy (no nodes). Add nodes later via sbgo add, or pass --protocols"
         return 0
     fi
-    # 前置校验: 协议名写错当场报参数错误, 免得部署完才发现零节点
-    local _supported="reality hy2 anytls vlesstcp tuic vmesstcp vmessquic trojan ss socks vlessws vmessws trojws direct" _bad="" _p
-    for _p in ${PROTOCOLS//,/ }; do
-        case "${_p,,}" in
-            reality|hy2|hysteria2|anytls|vlesstcp|tuic|vmesstcp|vmessquic|trojan|ss|shadowsocks|socks|vlessws|vmessws|trojws|trojanws|direct) ;;
-            *) _bad+=" $_p" ;;
-        esac
-    done
-    [[ -n "$_bad" ]] && die "unknown protocol(s):$_bad | supported: $_supported | aliases: hysteria2=hy2, shadowsocks=ss, trojanws=trojws"
-    # 跳跃段内的 UDP 流量会被 REDIRECT 到 hy2 端口: UDP 协议端口落在段内会直接被劫持, 部署前拦截
-    if is_true "$HY2_HOPPING" && grep -qi "hy2" <<<"$PROTOCOLS"; then
-        local hs="${HY2_HOPPING_RANGE%-*}" he="${HY2_HOPPING_RANGE#*-}" _pp _pn
-        for _pp in "tuic:$TUIC_PORT" "vmessquic:$VMESSQUIC_PORT"; do
-            _pn="${_pp%%:*}"
-            grep -qi "$_pn" <<<"$PROTOCOLS" || continue
-            if (( ${_pp##*:} >= hs && ${_pp##*:} <= he )); then
-                die "$_pn port ${_pp##*:} is inside hy2 hopping range $HY2_HOPPING_RANGE -- its UDP traffic would be redirected to hy2 ($HY2_PORT); pick a $_pn port outside the range or change --hy2-hopping-range"
-            fi
-        done
-    fi
-    for p in ${PROTOCOLS//,/ }; do
+    is_true "${PROTOCOL_SELECTION_READY:-false}" || select_protocols
+    for p in "${DEPLOY_PROTOCOLS[@]}"; do
         case "${p,,}" in
             reality)   add_reality ;;
             hy2|hysteria2) add_hy2 ;;
@@ -630,19 +827,43 @@ deploy_protocols() {
 }
 
 # ---------------- 10. 配置校验 ----------------
+validate_clients() {
+    local client
+    for client in "${CLIENT_OUT:-$STAGE_DIR/clients}"/*.json; do
+        [[ -f "$client" ]] || continue
+        "$STAGE_BIN" check -c "$client" > "$STAGE_DIR/client-check.log" 2>&1 \
+            || die "client config invalid ($client): $(cat "$STAGE_DIR/client-check.log")"
+        jq -e '
+          def ns:
+            . as $raw | if . == "0" then 0 else
+              [scan("([0-9]+(?:[.][0-9]+)?|[.][0-9]+)(ns|us|µs|μs|ms|s|m|h)")] as $p
+              | if ($p | map(join("")) | join("")) != $raw then error("invalid duration") else
+                $p | map(.[1] as $u | (.[0]|tonumber) * {ns:1,us:1000,"µs":1000,"μs":1000,ms:1000000,s:1000000000,m:60000000000,h:3600000000000}[$u]) | add
+                end end;
+          all(.outbounds[]?;
+            if .type == "hysteria2" and (.hop_interval_max // "") != "" then
+              ((.hop_interval // "30s" | if . == "" or . == "0" then "30s" else . end | ns) as $min
+               | (.hop_interval_max | ns) >= $min)
+            else true end)' "$client" >/dev/null \
+            || die "invalid Hy2 hopping interval bounds in $client: maximum must be at least the interval"
+    done
+}
+
 validate_config() {
-    if "$STAGE_BIN" check -c "$BUILD_BASE" -C "$BUILD_CONF" >/tmp/sb-check.log 2>&1; then
+    local check_log="$STAGE_DIR/sb-check.log"
+    validate_clients
+    if "$STAGE_BIN" check -c "$BUILD_BASE" -C "$BUILD_CONF" >"$check_log" 2>&1; then
         ok "sing-box check passed"
         return 0
     fi
-    if grep -qi "unknown flag\|unknown shorthand" /tmp/sb-check.log; then
+    if grep -qi "unknown flag\|unknown shorthand" "$check_log"; then
         warn "check -C not supported, fallback to merged check"
         jq -s 'reduce .[] as $f ({}; . * $f)' "$BUILD_BASE" "$BUILD_CONF"/*.json > "$STAGE_DIR/merged.json"
-        "$STAGE_BIN" check -c "$STAGE_DIR/merged.json" >/tmp/sb-check.log 2>&1 \
-            || die "config invalid: $(cat /tmp/sb-check.log)"
+        "$STAGE_BIN" check -c "$STAGE_DIR/merged.json" >"$check_log" 2>&1 \
+            || die "config invalid: $(cat "$check_log")"
         ok "sing-box check passed (merged)"
     else
-        die "config invalid: $(cat /tmp/sb-check.log)"
+        die "config invalid: $(cat "$check_log")"
     fi
 }
 
@@ -652,22 +873,50 @@ install_mgmt_script() {
     # 管理脚本来源: 默认从用户自己的 git 仓库 (vendored tarball)，可用 --mgmt-url 覆盖；
     # MGMT_URL 为空 = 不下载 (不再静默回退上游)
     [[ -z "$MGMT_URL" ]] && { warn "MGMT_URL is empty, management script skipped"; return 0; }
-    local url="$MGMT_URL"
+    local url="$MGMT_URL" manifest="$STAGE_DIR/code.sha256" digest
     local tmp="$STAGE_DIR/code.tar.gz"
-    dl "$url" "$tmp" || { warn "management script download failed, skipped"; return 0; }
-    mkdir -p "$SH_DIR"
-    tar xzf "$tmp" -C "$SH_DIR" || { warn "management script extract failed"; return 0; }
+    dl "$url" "$tmp" || { warn "management script download failed"; return 1; }
+    dl "${MGMT_SHA256_URL:-${url%%\?*}.sha256}" "$manifest" || { warn "management checksum download failed"; return 1; }
+    digest=$(manifest_hash "$manifest" "$(basename "${url%%\?*}")")
+    verify_sha256 "$tmp" "$digest" || { warn "management script checksum mismatch"; return 1; }
+    validate_archive "$tmp" || { warn "unsafe management archive"; return 1; }
+    local unpack="$STAGE_DIR/management" install_dir backup="$SB_DIR/.management-backup"
+    mkdir -p "$unpack" || return 1
+    tar xzf "$tmp" -C "$unpack" || { warn "management script extract failed"; return 1; }
     # 兼容 tarball 可能带顶层目录的情况
-    if [[ ! -f "$SH_DIR/sing-box.sh" ]]; then
+    if [[ ! -f "$unpack/sing-box.sh" ]]; then
         local sub
-        sub=$(find "$SH_DIR" -maxdepth 2 -name "sing-box.sh" | head -1)
+        sub=$(find "$unpack" -maxdepth 2 -name "sing-box.sh" | head -1)
         if [[ -n "$sub" ]]; then
             local d
             d=$(dirname "$sub")
-            cp -rf "$d"/* "$SH_DIR"/
+            unpack="$d"
         fi
     fi
-    [[ -f "$SH_DIR/sing-box.sh" ]] || { warn "management script layout unexpected"; return 0; }
+    [[ -f "$unpack/sing-box.sh" && -f "$unpack/src/core.sh" ]] || { warn "management script layout unexpected"; return 1; }
+    local script
+    while IFS= read -r script; do bash -n "$script" || return 1; done < <(find "$unpack" -type f -name '*.sh')
+    if is_true "$DRY_RUN"; then ok "management bundle integrity/syntax checked"; return 0; fi
+    local required_pm="${PKG_MGR:-}"
+    if ! command -v wget >/dev/null 2>&1; then
+        if [[ -z "$required_pm" ]]; then
+            if command -v apt-get >/dev/null 2>&1; then required_pm=apt-get
+            elif command -v dnf >/dev/null 2>&1; then required_pm=dnf
+            elif command -v yum >/dev/null 2>&1; then required_pm=yum; fi
+        fi
+        [[ -n "$required_pm" ]] && "$required_pm" install -y wget \
+            || { warn "management commands require wget; install it before retrying"; return 1; }
+    fi
+    [[ ! -e "$backup" ]] || { warn "previous management backup exists: $backup"; return 1; }
+    mkdir -p "$SB_DIR" || return 1
+    install_dir=$(mktemp -d "$SB_DIR/.management.XXXXXX") || return 1
+    cp -a "$unpack/." "$install_dir/" || { rm -rf "$install_dir"; return 1; }
+    [[ ! -d "$SH_DIR" ]] || mv "$SH_DIR" "$backup" || return 1
+    if ! mv "$install_dir" "$SH_DIR"; then
+        [[ ! -d "$backup" ]] || mv "$backup" "$SH_DIR"
+        return 1
+    fi
+    rm -rf "$backup"
     chmod +x "$SH_DIR/sing-box.sh"
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sing-box
     ln -sf "$SH_DIR/sing-box.sh" /usr/local/bin/sb
@@ -693,7 +942,7 @@ install_mgmt_script() {
 }
 
 install_systemd() {
-    cat > /lib/systemd/system/sing-box.service <<EOF
+    cat > "$SYSTEMD_DIR/sing-box.service.new" <<EOF
 [Unit]
 Description=sing-box Service
 Documentation=https://sing-box.sagernet.org/
@@ -713,70 +962,206 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
-    systemctl restart sing-box
+    mv -f "$SYSTEMD_DIR/sing-box.service.new" "$SYSTEMD_DIR/sing-box.service" || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable sing-box >/dev/null 2>&1 || return 1
+    systemctl restart sing-box || return 1
     sleep 2
     systemctl is-active --quiet sing-box && ok "sing-box service running" \
         || die "sing-box service failed to start, check: journalctl -u sing-box"
 }
 
 install_files() {
-    mkdir -p "$SB_DIR/bin" "$CONF_DIR" "$LOG_DIR"
+    mkdir -p "$SB_DIR/bin" "$CONF_DIR" "$LOG_DIR" || return 1
     # binary
     if [[ "$STAGE_BIN" != "$SB_BIN" ]]; then
-        cp -f "$STAGE_BIN" "$SB_BIN" && chmod +x "$SB_BIN"
+        local binary_tmp
+        binary_tmp=$(mktemp "$SB_DIR/bin/.core.XXXXXX") || return 1
+        cp -f "$STAGE_BIN" "$binary_tmp" && chmod +x "$binary_tmp" \
+            && mv -f "$binary_tmp" "$SB_BIN" || return 1
     fi
     # tls cert (gen_crypto 已按 CER_PATH/KEY_PATH 生成；正式部署时已在目标位置，无需拷贝)
     if [[ "$CER_PATH" != "$SB_DIR/bin/tls.cer" ]]; then
-        cp -f "$CER_PATH" "$SB_DIR/bin/tls.cer"
-        cp -f "$KEY_PATH" "$SB_DIR/bin/tls.key"
+        cp -f "$CER_PATH" "$SB_DIR/bin/tls.cer" || return 1
+        cp -f "$KEY_PATH" "$SB_DIR/bin/tls.key" || return 1
     fi
-    chmod 600 "$SB_DIR/bin/tls.key"
+    chmod 600 "$SB_DIR/bin/tls.key" || return 1
     # configs
-    cp -f "$BUILD_BASE" "$SB_DIR/config.json"
-    rm -f "$CONF_DIR"/*.json
-    cp -f "$BUILD_CONF"/*.json "$CONF_DIR"/
+    cp -f "$BUILD_BASE" "$SB_DIR/config.json.new" || return 1
+    jq --arg logfile "$LOG_DIR/access.log" '.log.output=$logfile' "$SB_DIR/config.json.new" \
+        > "$SB_DIR/config.json" || return 1
+    rm -f "$SB_DIR/config.json.new" "$CONF_DIR"/*.json || return 1
+    local f
+    for f in "$BUILD_CONF"/*.json; do
+        [[ -f "$f" ]] || continue
+        jq --arg old_cert "$CER_PATH" --arg old_key "$KEY_PATH" \
+            --arg cert "$SB_DIR/bin/tls.cer" --arg key "$SB_DIR/bin/tls.key" '
+            .inbounds |= map(
+                if .tls.certificate_path == $old_cert then .tls.certificate_path=$cert else . end
+                | if .tls.key_path == $old_key then .tls.key_path=$key else . end)' \
+            "$f" > "$CONF_DIR/$(basename "$f")" || return 1
+    done
     # client configs
     if compgen -G "$CLIENT_OUT/*.json" >/dev/null 2>&1; then
-        cp -f "$CLIENT_OUT"/*.json "$SB_DIR"/
+        cp -f "$CLIENT_OUT"/*.json "$SB_DIR"/ || return 1
     fi
+    cp -f "$STAGE_DIR/nodes.txt" "$STAGE_DIR/deploy-result.json" "$SB_DIR"/ || return 1
     ok "files installed to $SB_DIR"
 }
 
+begin_install() {
+    BACKUP_DIR="$STAGE_DIR/backup"
+    mkdir -p "$BACKUP_DIR/units" "$SYSTEMD_DIR" || return 1
+    OLD_INSTALL=false; OLD_CORE_ACTIVE=false; OLD_CORE_ENABLED=false
+    OLD_HOP_ACTIVE=false; OLD_HOP_ENABLED=false
+    [[ -d "$SB_DIR" ]] && { cp -a "$SB_DIR" "$BACKUP_DIR/sing-box" || return 1; OLD_INSTALL=true; }
+    systemctl is-active --quiet sing-box && OLD_CORE_ACTIVE=true
+    systemctl is-enabled --quiet sing-box && OLD_CORE_ENABLED=true
+    local unit
+    for unit in sing-box sb-porthopping; do
+        [[ ! -e "$SYSTEMD_DIR/$unit.service" ]] || cp -a "$SYSTEMD_DIR/$unit.service" "$BACKUP_DIR/units/" || return 1
+    done
+    if [[ -e "$SYSTEMD_DIR/sb-porthopping.service" ]]; then
+        systemctl is-active --quiet sb-porthopping && OLD_HOP_ACTIVE=true
+        systemctl is-enabled --quiet sb-porthopping && OLD_HOP_ENABLED=true
+    fi
+    INSTALL_IN_PROGRESS=true
+    if is_true "$OLD_CORE_ACTIVE" || [[ -e "$SYSTEMD_DIR/sing-box.service" ]]; then
+        systemctl stop sing-box || return 1
+    fi
+    cleanup_hopping || return 1
+    return 0
+}
+
+rollback_install() {
+    local hopping_failed=false
+    warn "deployment failed; restoring the previous installation"
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    # Disable while the new unit still exists, so first-install rollback removes
+    # enablement links instead of leaving dangling wanted-by entries.
+    systemctl disable sing-box >/dev/null 2>&1 || true
+    cleanup_hopping || { warn "port hopping cleanup failed; continuing core recovery" >&2; hopping_failed=true; }
+    rm -rf "$SB_DIR" || return 1
+    is_true "$OLD_INSTALL" && { cp -a "$BACKUP_DIR/sing-box" "$SB_DIR" || return 1; }
+    local unit
+    for unit in sing-box sb-porthopping; do
+        rm -f "$SYSTEMD_DIR/$unit.service" "$SYSTEMD_DIR/$unit.service.new" || return 1
+        [[ ! -e "$BACKUP_DIR/units/$unit.service" ]] || cp -a "$BACKUP_DIR/units/$unit.service" "$SYSTEMD_DIR/" || return 1
+    done
+    systemctl daemon-reload || return 1
+    if is_true "$OLD_CORE_ENABLED"; then systemctl enable sing-box >/dev/null 2>&1 || return 1
+    else systemctl disable sing-box >/dev/null 2>&1 || true; fi
+    if is_true "$OLD_CORE_ACTIVE"; then systemctl start sing-box || return 1; fi
+    if is_true "$OLD_HOP_ENABLED"; then systemctl enable sb-porthopping >/dev/null 2>&1 || hopping_failed=true; fi
+    if [[ -f "$SB_DIR/hy2-hopping.sh" ]]; then bash "$SB_DIR/hy2-hopping.sh" || hopping_failed=true; fi
+    if is_true "$OLD_HOP_ACTIVE"; then systemctl start sb-porthopping || hopping_failed=true; fi
+    INSTALL_IN_PROGRESS=false
+    if is_true "$hopping_failed"; then
+        warn "core restored; port hopping recovery incomplete, backup retained at $BACKUP_DIR" >&2
+        return 1
+    fi
+    ok "previous installation restored"
+}
+
+finish_install() { INSTALL_IN_PROGRESS=false; }
+
+deploy_cleanup() {
+    local status="$1" keep="${KEEP_STAGE:-false}"
+    trap - EXIT
+    if is_true "${INSTALL_IN_PROGRESS:-false}"; then
+        rollback_install || { warn "rollback failed; backup retained at $BACKUP_DIR"; keep=true; status=1; }
+    fi
+    is_true "$keep" || rm -rf "$STAGE_DIR"
+    exit "$status"
+}
+
 # ---------------- 12. Hy2 端口跳跃 ----------------
+cleanup_hopping() {
+    local to="" start="" end="" ipt row rows handle
+    if [[ -f "$SB_DIR/hy2-hopping.sh" ]]; then
+        to=$(sed -n 's/.*TO=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+        start=$(sed -n 's/^START=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+        end=$(sed -n 's/.*END=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+    fi
+    if [[ -e "$SYSTEMD_DIR/sb-porthopping.service" ]]; then
+        systemctl disable --now sb-porthopping >/dev/null 2>&1 || return 1
+    fi
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        if "$ipt" -t nat -C PREROUTING -j SB_HY2_HOP >/dev/null 2>&1; then
+            "$ipt" -t nat -D PREROUTING -j SB_HY2_HOP || return 1
+        fi
+        "$ipt" -t nat -F SB_HY2_HOP 2>/dev/null || true
+        "$ipt" -t nat -X SB_HY2_HOP 2>/dev/null || true
+        [[ -n "$to" && -n "$start" && -n "$end" ]] || continue
+        rows=$("$ipt" -t nat -S PREROUTING 2>/dev/null) || return 1
+        while IFS= read -r row; do
+            if [[ " $row " == *" -p udp "* && " $row " == *" -j REDIRECT "* \
+                && " $row " == *" --to-ports $to "* && " $row " == *" --dport $start:$end "* ]]; then
+                local -a rule
+                read -r -a rule <<<"$row"
+                rule[0]=-D
+                "$ipt" -t nat "${rule[@]}" || return 1
+            fi
+        done <<<"$rows"
+    done
+    if command -v nft >/dev/null 2>&1; then
+        if nft list table inet sb_hy2_hop >/dev/null 2>&1; then
+            nft delete table inet sb_hy2_hop || return 1
+        fi
+        if [[ -n "$to" && -n "$start" && -n "$end" ]]; then
+            rows=$(nft -a list chain ip nat PREROUTING 2>/dev/null) || rows=""
+            while IFS= read -r row; do
+                if [[ "$row" == *"udp dport $start-$end redirect to :$to "* && "$row" =~ handle\ ([0-9]+) ]]; then
+                    handle="${BASH_REMATCH[1]}"
+                    nft delete rule ip nat PREROUTING handle "$handle" || return 1
+                fi
+            done <<<"$rows"
+        fi
+    fi
+    rm -f "$SYSTEMD_DIR/sb-porthopping.service" "$SB_DIR/hy2-hopping.sh" || return 1
+    systemctl daemon-reload || return 1
+    if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true; fi
+}
+
 setup_hopping() {
     is_true "$HY2_HOPPING" || return 0
-    grep -q "hy2" <<<"${PROTOCOLS,,}" || return 0
+    has_deployed hy2 || return 0
     local start="${HY2_HOPPING_RANGE%-*}" end="${HY2_HOPPING_RANGE#*-}" to="$HY2_PORT"
     cat > "$SB_DIR/hy2-hopping.sh" <<EOF
 #!/bin/bash
-# auto-generated: hy2 port hopping NAT rules (idempotent; removes stale ranges)
+set -e
+# auto-generated: isolated Hy2 port hopping rules
 START=$start; END=$end; TO=$to
 _hop_apply() {
   local ipt=\$1
   command -v \$ipt >/dev/null 2>&1 || return 0
-  # 清理旧跳跃段遗留规则: REDIRECT 到 \$TO 但 dport 范围不是当前的, 删掉
-  # (否则段内其他 UDP 服务——如 sbgo add 的随机端口 tuic——会被劫持到 hy2)
-  \$ipt -t nat -S PREROUTING 2>/dev/null | grep -- "--to-ports \$TO" | while IFS= read -r line; do
-    case "\$line" in
-      *"--dport \$START:\$END"*) ;;
-      *) \$ipt -t nat -D \${line#-A } 2>/dev/null || true ;;
-    esac
-  done
-  \$ipt -t nat -C PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO 2>/dev/null || \
-  \$ipt -t nat -A PREROUTING -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO
+  \$ipt -t nat -N SB_HY2_HOP 2>/dev/null || true
+  \$ipt -t nat -F SB_HY2_HOP
+  \$ipt -t nat -A SB_HY2_HOP -p udp --dport \$START:\$END -j REDIRECT --to-ports \$TO
+  \$ipt -t nat -C PREROUTING -j SB_HY2_HOP 2>/dev/null || \$ipt -t nat -A PREROUTING -j SB_HY2_HOP
 }
-_hop_apply iptables
-_hop_apply ip6tables
-if ! command -v iptables >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
-  nft list chain ip nat PREROUTING 2>/dev/null | grep -q "udp dport \$START-\$END" || \
-  nft add rule ip nat PREROUTING udp dport \$START-\$END redirect to :\$TO 2>/dev/null || true
+if command -v iptables >/dev/null 2>&1; then
+  _hop_apply iptables
+  _hop_apply ip6tables
+elif command -v nft >/dev/null 2>&1; then
+  nft list table inet sb_hy2_hop >/dev/null 2>&1 && nft delete table inet sb_hy2_hop
+  nft -f - <<NFT
+table inet sb_hy2_hop {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport \$START-\$END redirect to :\$TO
+  }
+}
+NFT
+else
+  echo "[ERR] port hopping requires iptables or nftables" >&2
+  exit 1
 fi
 EOF
-    chmod +x "$SB_DIR/hy2-hopping.sh"
-    "$SB_DIR/hy2-hopping.sh"
-    cat > /lib/systemd/system/sb-porthopping.service <<EOF
+    chmod +x "$SB_DIR/hy2-hopping.sh" || return 1
+    "$SB_DIR/hy2-hopping.sh" || return 1
+    cat > "$SYSTEMD_DIR/sb-porthopping.service" <<EOF
 [Unit]
 Description=sing-box Hy2 port hopping NAT rules
 After=network.target
@@ -790,8 +1175,8 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable sb-porthopping >/dev/null 2>&1
+    systemctl daemon-reload || return 1
+    systemctl enable --now sb-porthopping >/dev/null 2>&1 || return 1
     # native persistence (best effort)
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save >/dev/null 2>&1 || true
@@ -809,8 +1194,8 @@ enable_bbr() {
         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control = bbr" >>/etc/sysctl.conf
         echo "net.core.default_qdisc = fq" >>/etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1 || true
-        ok "BBR enabled"
+        if sysctl -p >/dev/null 2>&1; then ok "BBR enabled"
+        else warn "BBR settings written, but sysctl could not apply them" >&2; fi
     else
         warn "kernel too old for BBR, skipped"
     fi
@@ -820,13 +1205,13 @@ open_firewall() {
     is_true "$OPEN_FIREWALL" || return 0
     local opened=0
     # hy2 hopping range (udp)
-    if is_true "$HY2_HOPPING" && grep -q "hy2" <<<"${PROTOCOLS,,}"; then
+    if is_true "$HY2_HOPPING" && has_deployed hy2; then
         local start="${HY2_HOPPING_RANGE%-*}" end="${HY2_HOPPING_RANGE#*-}"
-        fw_allow udp "$start:$end" && opened=1
+        if fw_allow udp "$start:$end"; then opened=1; else warn "could not open udp $start:$end" >&2; fi
     fi
-    for p in "${TCP_PORTS[@]}"; do fw_allow tcp "$p" && opened=1; done
-    for p in "${UDP_PORTS[@]}"; do fw_allow udp "$p" && opened=1; done
-    [[ $opened -eq 1 ]] && ok "firewall ports opened" || warn "firewall: no tool available, skipped"
+    for p in "${TCP_PORTS[@]}"; do if fw_allow tcp "$p"; then opened=1; else warn "could not open tcp $p" >&2; fi; done
+    for p in "${UDP_PORTS[@]}"; do if fw_allow udp "$p"; then opened=1; else warn "could not open udp $p" >&2; fi; done
+    [[ $opened -eq 1 ]] && ok "firewall rules applied (see warnings for any failures)" || warn "firewall ports could not be opened automatically" >&2
 }
 
 fw_allow() { # proto port-or-range
@@ -834,12 +1219,12 @@ fw_allow() { # proto port-or-range
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "$port/$proto" >/dev/null 2>&1 && return 0
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="$port/$proto" >/dev/null 2>&1 \
+        firewall-cmd --permanent --add-port="${port/:/-}/$proto" >/dev/null 2>&1 \
             && firewall-cmd --reload >/dev/null 2>&1 && return 0
     elif command -v iptables >/dev/null 2>&1; then
         local dp="$port"; [[ "$port" == *:* ]] && dp="${port/:/:}"
         iptables -C INPUT -p "$proto" --dport "$dp" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p "$proto" --dport "$dp" -j ACCEPT 2>/dev/null
+            iptables -I INPUT -p "$proto" --dport "$dp" -j ACCEPT 2>/dev/null || return 1
         return 0
     fi
     return 1
@@ -850,11 +1235,13 @@ write_outputs() {
     local outdir="$1"  # staging or final dir
     local nodes_json
     nodes_json=$(printf '%s\n' "${NODES_JSON[@]}" | jq -s '.')
+    local skipped_json
+    skipped_json=$(printf '%s\n' "${SKIPPED_JSON[@]}" | jq -s '.')
     # deploy-result.json
     jq -n --arg ver "$SB_VERSION" --arg ip "$SERVER_IP" --arg name "$NODE_NAME" \
-        --arg date "$(date -u +%FT%TZ)" --argjson nodes "$nodes_json" \
+        --arg date "$(date -u +%FT%TZ)" --argjson nodes "$nodes_json" --argjson skipped "$skipped_json" \
         '{deployed_at:$date, sing_box_version:$ver, server_ip:$ip,
-          node_name:$name, protocols:($nodes|map(.protocol)), nodes:$nodes}' \
+          node_name:$name, protocols:($nodes|map(.protocol)), nodes:$nodes, skipped:$skipped}' \
         > "$outdir/deploy-result.json"
     # nodes.txt
     {
@@ -875,7 +1262,8 @@ write_outputs() {
              then "  hopping: udp \(.hopping.range) -> \(.port) (interval: \(.hopping.hop_interval))" else empty end),
             (if .client_config then "  client_config: \(.client_config)" else empty end),
             "  url: \(.url // "-")",
-            ""'
+             ""'
+        printf '%s\n' "${SKIPPED_JSON[@]}" | jq -s -r '.[] | "SKIPPED \(.protocol): \(.reason)"'
     } > "$outdir/nodes.txt"
     ok "outputs: $outdir/nodes.txt, $outdir/deploy-result.json"
 }
@@ -886,6 +1274,7 @@ print_summary() {
     echo "sing-box: $SB_VERSION | server: $SERVER_IP"
     echo ""
     printf '%s\n' "${NODES_JSON[@]}" | jq -s -r '.[] | "\(.protocol) [\(.port)]:\n\(.url // "-")"'
+    printf '%s\n' "${SKIPPED_JSON[@]}" | jq -s -r '.[] | "SKIPPED \(.protocol): \(.reason)"'
     echo ""
     if is_true "$DRY_RUN"; then
         echo "(dry-run: 未修改系统, 配置见 $STAGE_DIR)"
@@ -965,54 +1354,115 @@ _mgmt_node_url() { # 通过管理脚本取单个 conf 的分享链接 (走它打
 }
 
 cmd_install_mgmt() { # 单独安装/重装管理脚本 (不重部署、不轮换密码)
-    STAGE_DIR=$(mktemp -d)
+    parse_args "$@"
+    umask 077
+    STAGE_DIR=$(mktemp -d) || die "cannot create management staging directory"
     dl_init
     INSTALL_MGMT=true
-    install_mgmt_script
+    install_mgmt_script || { rm -rf "$STAGE_DIR"; die "management installation failed"; }
     rm -rf "$STAGE_DIR"
+    is_true "$DRY_RUN" && return 0
     [[ -x /usr/local/bin/sing-box ]] && ok "管理脚本可用: sing-box / sb" \
         || die "管理脚本安装失败，请检查网络后重试 (可这样走代理: DOWNLOAD_PROXY=https://gh-proxy.com/ sbgo install-mgmt)"
 }
 
+cmd_sync_hopping() { # sync-hopping old-port new-port (0 = removed/converted)
+    local old="$1" new="${2:-0}" to start end inbound='{}' f client="" tmp status=0
+    valid_port "$old" && { [[ "$new" == 0 ]] || valid_port "$new"; } || die "invalid hopping port change"
+    [[ -f "$SB_DIR/hy2-hopping.sh" ]] || return 0
+    to=$(sed -n 's/.*TO=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+    [[ "$to" == "$old" ]] || return 0
+    start=$(sed -n 's/^START=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+    end=$(sed -n 's/.*END=\([0-9]*\).*/\1/p' "$SB_DIR/hy2-hopping.sh" | head -1)
+    valid_port "$start" && valid_port "$end" && (( start <= end )) || die "invalid persisted hopping range"
+    if [[ "$new" != 0 ]]; then
+        for f in "$CONF_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            inbound=$(jq -c --argjson port "$new" '.inbounds[] | select(.type == "hysteria2" and .listen_port == $port)' "$f")
+            [[ -z "$inbound" ]] || break
+        done
+        [[ -n "$inbound" && "$inbound" != '{}' ]] || die "new hopping target has no Hy2 inbound"
+    fi
+    umask 077
+    tmp=$(mktemp -d) || die "cannot back up hopping state"
+    local -a paths=("$SB_DIR/hy2-hopping.sh" "$SYSTEMD_DIR/sb-porthopping.service" "$SB_DIR/deploy-result.json" "$SB_DIR/nodes.txt")
+    if [[ -f "$SB_DIR/deploy-result.json" ]]; then
+        client=$(jq -r --argjson port "$old" '.nodes[] | select(.protocol == "hy2" and .port == $port) | .client_config // empty' "$SB_DIR/deploy-result.json")
+        [[ -z "$client" || "$client" == "$SB_DIR/"* ]] || { rm -rf "$tmp"; die "client artifact is outside sing-box directory"; }
+        [[ -z "$client" ]] || paths+=("$client")
+    fi
+    local i=0 enabled=false active=false
+    systemctl is-enabled --quiet sb-porthopping && enabled=true
+    systemctl is-active --quiet sb-porthopping && active=true
+    for f in "${paths[@]}"; do
+        [[ ! -e "$f" ]] || cp -a "$f" "$tmp/$i" || { rm -rf "$tmp"; return 1; }
+        i=$((i+1))
+    done
+    HY2_PORT="$new"; HY2_HOPPING=true; HY2_HOPPING_RANGE="$start-$end"; DEPLOY_PROTOCOLS=(hy2)
+    if [[ "$new" != "$old" ]]; then
+        cleanup_hopping || status=1
+        if [[ "$status" == 0 && "$new" != 0 ]]; then setup_hopping || status=1; fi
+    fi
+    if [[ "$status" == 0 && -f "$SB_DIR/deploy-result.json" ]]; then
+        jq --argjson old "$old" --argjson new "$new" --argjson inbound "$inbound" --arg range "$HY2_HOPPING_RANGE" '
+          .server_ip as $ip
+          | .nodes |= map(if .protocol == "hy2" and .port == $old then
+              if $new == 0 then empty else
+                .port=$new | .password=$inbound.users[0].password | .hopping.range=$range
+                | .url=("hy2://" + (.password|@uri) + "@" + (if ($ip|contains(":")) then "["+$ip+"]" else $ip end)
+                        + ":" + ($new|tostring) + "?insecure=1&mport=" + $range + "#" + ($inbound.tag|@uri))
+              end else . end)
+          | .protocols=(.nodes|map(.protocol))' "$SB_DIR/deploy-result.json" > "$tmp/result.json" \
+            && mv "$tmp/result.json" "$SB_DIR/deploy-result.json" || status=1
+        if [[ "$status" == 0 ]]; then
+            jq -r '.nodes[] | "\(.protocol) [\(.port)]:\n\(.url // "-")\n"' "$SB_DIR/deploy-result.json" > "$tmp/nodes.txt" \
+                && mv "$tmp/nodes.txt" "$SB_DIR/nodes.txt" || status=1
+        fi
+    fi
+    if [[ "$status" == 0 && -n "$client" && -f "$client" ]]; then
+        if [[ "$new" == 0 ]]; then rm -f "$client" || status=1
+        else
+            jq --arg password "$(jq -r '.users[0].password' <<<"$inbound")" --arg range "$start:$end" '
+              .outbounds |= map(if .type == "hysteria2" then .password=$password | del(.server_port) | .server_ports=[$range] else . end)' \
+                "$client" > "$tmp/client.json" && mv "$tmp/client.json" "$client" || status=1
+        fi
+    fi
+    if [[ "$status" == 0 ]]; then
+        if [[ "$new" != 0 ]] && is_true "$OPEN_FIREWALL"; then fw_allow udp "$new" || warn "could not open updated Hy2 port $new" >&2; fi
+        rm -rf "$tmp"; return 0
+    fi
+    # The caller restores its node transaction; restore the companion hopping
+    # state here so its previous target/credentials remain coherent.
+    cleanup_hopping >/dev/null 2>&1 || true
+    i=0
+    for f in "${paths[@]}"; do
+        rm -f "$f"
+        [[ ! -e "$tmp/$i" ]] || cp -a "$tmp/$i" "$f" || { warn "hopping backup retained: $tmp" >&2; return 1; }
+        i=$((i+1))
+    done
+    systemctl daemon-reload || return 1
+    bash "$SB_DIR/hy2-hopping.sh" || { warn "hopping backup retained: $tmp" >&2; return 1; }
+    if is_true "$enabled"; then systemctl enable sb-porthopping >/dev/null 2>&1 || return 1; fi
+    if is_true "$active"; then systemctl start sb-porthopping || return 1; fi
+    rm -rf "$tmp"
+    warn "hopping update failed; previous state restored" >&2
+    return 1
+}
+
 cmd_uninstall() { # 卸载: 转发给管理脚本 (缺失时走手动流程) + 清理本脚本的附加项
-    # 先记下跳跃目标端口 (卸载后 hy2-hopping.sh 可能被删掉)
-    local hop_to=""
-    [[ -f "$SB_DIR/hy2-hopping.sh" ]] && hop_to=$(sed -n 's/^TO=\([0-9]*\)/\1/p' "$SB_DIR/hy2-hopping.sh")
-    [[ -z "$hop_to" ]] && hop_to="$HY2_PORT"
+    cleanup_hopping || die "cannot remove port hopping rules"
     if [[ -x "$MGMT_BIN" ]]; then
-        "$MGMT_BIN" uninstall "$@"
+        "$MGMT_BIN" uninstall "$@" || die "management uninstall failed"
     else
         warn "管理脚本未安装，执行手动卸载流程"
         systemctl stop sing-box 2>/dev/null || true
         systemctl disable sing-box 2>/dev/null || true
         rm -rf "$SB_DIR" /var/log/sing-box /usr/local/bin/sing-box /usr/local/bin/sb \
-            /lib/systemd/system/sing-box.service
+            "$SYSTEMD_DIR/sing-box.service"
         sed -i "/alias sing-box=/d" /root/.bashrc 2>/dev/null || true
         systemctl daemon-reload 2>/dev/null || true
         ok "sing-box 已手动卸载"
     fi
-    # 清理 auto-deploy.sh 的附加项 (原管理脚本不认识它们)
-    if systemctl list-unit-files 2>/dev/null | grep -q "^sb-porthopping.service"; then
-        systemctl disable --now sb-porthopping 2>/dev/null || true
-        rm -f /lib/systemd/system/sb-porthopping.service
-        systemctl daemon-reload 2>/dev/null || true
-        ok "sb-porthopping.service removed"
-    fi
-    # 删掉 hy2 跳跃的 nat REDIRECT 规则: 服务只管开机重加, 活的规则必须手动清;
-    # 顺带清掉指向同一 hy2 端口的旧跳跃段残留
-    local _ipt _line _n=0
-    for _ipt in iptables ip6tables; do
-        command -v "$_ipt" >/dev/null 2>&1 || continue
-        while IFS= read -r _line; do
-            case "$_line" in
-                *"-p udp"*) "$_ipt" -t nat -D ${_line#-A } 2>/dev/null && _n=$((_n+1)) ;;
-            esac
-        done < <("$_ipt" -t nat -S PREROUTING 2>/dev/null | grep -- "--to-ports $hop_to")
-    done
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-    fi
-    [[ $_n -gt 0 ]] && ok "hy2 hopping NAT rules removed ($_n)" || log "no hy2 hopping NAT rules found"
     if [[ -L /usr/local/bin/sbgo ]]; then
         rm -f /usr/local/bin/sbgo
         ok "sbgo shortcut removed"
@@ -1046,7 +1496,8 @@ sbgo_main() { # 以 sbgo 之名被调用时的入口 (管理模式，无参数�
     case "${1:-}" in
         ""|-h|--help) mgmt_usage ;;
         deploy) shift; deploy_flow "$@" ;;
-        install-mgmt) cmd_install_mgmt ;;
+        install-mgmt) shift; cmd_install_mgmt "$@" ;;
+        sync-hopping) shift; cmd_sync_hopping "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
@@ -1082,7 +1533,8 @@ main() {
     case "${1:-}" in
         ""|--*) deploy_flow "$@" ;;
         deploy) shift; deploy_flow "$@" ;;
-        install-mgmt) cmd_install_mgmt ;;
+        install-mgmt) shift; cmd_install_mgmt "$@" ;;
+        sync-hopping) shift; cmd_sync_hopping "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         list) cmd_list ;;
         nodes) cmd_nodes ;;
@@ -1100,17 +1552,21 @@ main() {
 
 deploy_flow() {
     parse_args "$@"
-
-    STAGE_DIR=$(mktemp -d)
+    [[ -n "$NODE_NAME" && "$NODE_NAME" != *'/'* && "$NODE_NAME" != *$'\n'* ]] || die "invalid node name"
+    umask 077
+    STAGE_DIR=$(mktemp -d) || die "cannot create staging directory"
+    INSTALL_IN_PROGRESS=false; KEEP_STAGE=false; PROTOCOL_SELECTION_READY=false
+    trap 'deploy_cleanup $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     BUILD_CONF="$STAGE_DIR/conf"; mkdir -p "$BUILD_CONF"
     BUILD_BASE="$STAGE_DIR/config.json"
     CLIENT_OUT="$STAGE_DIR/clients"; mkdir -p "$CLIENT_OUT"
 
+    CER_PATH="$STAGE_DIR/bin/tls.cer"; KEY_PATH="$STAGE_DIR/bin/tls.key"
     if is_true "$DRY_RUN"; then
-        CER_PATH="$STAGE_DIR/bin/tls.cer"; KEY_PATH="$STAGE_DIR/bin/tls.key"
         FINAL_CLIENT_DIR="$CLIENT_OUT"
     else
-        CER_PATH="$SB_DIR/bin/tls.cer"; KEY_PATH="$SB_DIR/bin/tls.key"
         FINAL_CLIENT_DIR="$SB_DIR"
     fi
 
@@ -1121,33 +1577,35 @@ deploy_flow() {
     install_deps
     resolve_version
     download_binary
+    select_protocols
     gen_credentials
     detect_ip
     gen_crypto
     build_base_config
     deploy_protocols
     validate_config
+    write_outputs "$STAGE_DIR" || die "cannot write deployment results"
 
     if is_true "$DRY_RUN"; then
-        write_outputs "$STAGE_DIR"
+        KEEP_STAGE=true
         print_summary
         log "dry-run done, staging dir kept at: $STAGE_DIR"
         return 0
     fi
 
+    begin_install || die "cannot prepare installation backup or stop the existing service"
+    install_files || die "file installation failed"
+    install_systemd || die "sing-box service installation/start failed"
+    setup_hopping || die "port hopping setup failed"
+    finish_install
     timedatectl set-ntp true >/dev/null 2>&1 || true
-    install_files
-    install_mgmt_script
+    install_mgmt_script || warn "management installation failed; core deployment succeeded"
     install_sbgo_shortcut
-    install_systemd
-    setup_hopping
     enable_bbr
     open_firewall
-    write_outputs "$SB_DIR"
     # client configs already copied by install_files; fix notes path
     print_summary
 
-    rm -rf "$STAGE_DIR"
     ok "done"
 }
 

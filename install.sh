@@ -34,6 +34,7 @@ DEFAULT_ARGS=(
     --hy2-password 2kge73478g
     --hy2-hopping true
     --hy2-hopping-range 60000-64000
+    --hy2-hop-interval 2s
     --hy2-hop-interval-max 4s
     --anytls-port 9443
     --anytls-password 2kge73478g
@@ -55,6 +56,7 @@ DEFAULT_Hy2=(
     --hy2-password 2kge73478g
     --hy2-hopping true
     --hy2-hopping-range 60000-64000
+    --hy2-hop-interval 2s
     --hy2-hop-interval-max 4s
 )
 DEFAULT_Anytls=(
@@ -113,35 +115,42 @@ DEFAULT_Direct=(
 )
 # ============ 分组默认参数结束 ============
 
-echo "[install] downloading auto-deploy.sh ..."
-# --retry: cloud-init 开机时网络可能未完全就绪; ?t=: 破 raw CDN 缓存
-curl -fsSL --retry 3 --retry-delay 5 "$REPO_BASE/auto-deploy.sh?t=$(date +%s)" -o "$TARGET"
-chmod +x "$TARGET"
+is_boolean_option() { case "$1" in --enable-bbr|--open-firewall|--install-mgmt|--dry-run|--force|--hy2-hopping) return 0 ;; *) return 1 ;; esac; }
+is_boolean_value() { case "${1,,}" in true|false|1|0|yes|no|y|n|"") return 0 ;; *) return 1 ;; esac; }
 
-if [[ "${1:-}" == "uninstall" ]]; then
-    echo "[install] uninstalling ..."
-    "$TARGET" uninstall
-    exit 0
-fi
-
-# 分拣参数: 已知协议名 (含别名) 和 default 进 protos, 其余 (--xxx 及其值) 原样进 extra
+# 分拣参数时一起消费选项及其值，布尔简写不能吞掉后面的协议名。
 protos=()
 extra=()
-for a in "$@"; do
-    case "${a,,}" in
+uninstall=false
+[[ "${1:-}" == uninstall ]] && { uninstall=true; shift; }
+while [[ $# -gt 0 ]]; do
+    case "${1,,}" in
+        --*=*)
+            if is_boolean_option "${1%%=*}" && ! is_boolean_value "${1#*=}"; then
+                echo '[install] invalid boolean option value' >&2; exit 1
+            fi
+            extra+=("$1"); shift ;;
+        -h|--help)
+            extra+=("$1"); shift ;;
+        --*)
+            option="$1"; extra+=("$1"); shift
+            if is_boolean_option "$option"; then
+                if [[ $# -gt 0 ]] && is_boolean_value "$1"; then extra+=("$1"); shift; fi
+            elif [[ $# -gt 0 && "$1" != --* ]]; then extra+=("$1"); shift
+            else
+                echo "[install] $option requires a value" >&2; exit 1
+            fi ;;
         default)
-            ;; # 标记性质, 单独出现时等价于不带参数
+            shift ;;
         reality|hy2|hysteria2|anytls|vlesstcp|vmesstcp|vmessquic|tuic|trojan|ss|shadowsocks|socks|vlessws|vmessws|trojws|trojanws|direct)
-            protos+=("$a") ;;
+            protos+=("$1"); shift ;;
         *)
-            extra+=("$a") ;;
+            extra+=("$1"); shift ;;
     esac
 done
 
 if [[ ${#protos[@]} -eq 0 ]]; then
-    echo "[install] deploying DEFAULT set (extra args: ${extra[*]:-none}) ..."
-    # extra 放在最后: 命令行参数覆盖 DEFAULT_ARGS
-    "$TARGET" "${DEFAULT_ARGS[@]}" "${extra[@]+"${extra[@]}"}"
+    run_args=("${DEFAULT_ARGS[@]}")
 else
     proto_csv=$(IFS=,; echo "${protos[*]}")
     run_args=(--protocols "$proto_csv" "${DEFAULT_Common[@]}")
@@ -163,6 +172,35 @@ else
             direct)          run_args+=("${DEFAULT_Direct[@]+"${DEFAULT_Direct[@]}"}") ;;
         esac
     done
-    echo "[install] deploying protocols: $proto_csv (extra args: ${extra[*]:-none}) ..."
-    "$TARGET" "${run_args[@]}" "${extra[@]+"${extra[@]}"}"
+fi
+run_args+=("${extra[@]+"${extra[@]}"}")
+
+dry="${DRY_RUN:-false}"
+for ((i=0; i<${#run_args[@]}; i++)); do
+    case "${run_args[$i]}" in
+        --dry-run=*) dry="${run_args[$i]#*=}" ;;
+        --dry-run) dry=true; if [[ $((i+1)) -lt ${#run_args[@]} ]] && is_boolean_value "${run_args[$((i+1))]}"; then dry="${run_args[$((i+1))]}"; fi ;;
+        -h|--help) dry=true ;;
+    esac
+done
+is_boolean_value "$dry" || { echo '[install] DRY_RUN requires a boolean value' >&2; exit 1; }
+stage=""
+case "${dry,,}" in true|1|yes|y) stage=$(mktemp -d); TARGET="$stage/auto-deploy.sh" ;; esac
+tmp=$(mktemp "${TARGET}.XXXXXX")
+trap 'rm -f "$tmp" "$tmp.sha256"; [[ -z "$stage" ]] || rm -rf "$stage"' EXIT
+echo "[install] downloading auto-deploy.sh ..."
+curl -fsSL --retry 3 --retry-delay 5 --max-time 120 "$REPO_BASE/auto-deploy.sh?t=$(date +%s)" -o "$tmp"
+curl -fsSL --retry 3 --retry-delay 5 --max-time 120 "$REPO_BASE/auto-deploy.sh.sha256?t=$(date +%s)" -o "$tmp.sha256"
+digest=$(awk '$2 == "auto-deploy.sh" {print $1; exit}' "$tmp.sha256")
+[[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || { echo '[install] invalid checksum manifest' >&2; exit 1; }
+printf '%s  %s\n' "$digest" "$tmp" | sha256sum -c - >/dev/null
+bash -n "$tmp"
+chmod 700 "$tmp"
+mv -f "$tmp" "$TARGET"
+if [[ "$uninstall" == true ]]; then
+    echo "[install] uninstalling ..."
+    "$TARGET" uninstall
+else
+    echo "[install] deploying selected protocols ..."
+    "$TARGET" "${run_args[@]}"
 fi

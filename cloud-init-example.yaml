@@ -1,8 +1,7 @@
+#cloud-config
 # cloud-init 示例: sing-box 全自动部署 (经由 install.sh 一键包装脚本)
 # 用法: 将本文件内容作为云厂商自定义数据 (user-data) 粘贴, 或合并到现有 cloud-config
 # 注意: runcmd 已是 root 身份, 不需要 sudo
-
-#cloud-config
 
 runcmd:
   # 方式 A: 一条命令, 用 install.sh 内置默认参数部署
