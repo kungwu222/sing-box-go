@@ -262,6 +262,19 @@ sbgo uninstall             # 卸载（含跳跃 NAT 规则、sb-porthopping.serv
 sbgo deploy --protocols hy2  # 重新部署（需显式指定，避免误触）
 ```
 
+`--name` 设置节点显示名（inbound 的 `tag`），配置文件仍按协议和端口命名。
+`del/info/url/qr/change` 同时支持节点显示名和配置文件名。例如：
+
+```bash
+sbgo add socks 8089 myuser mypass --name AWS-ohio
+sbgo info AWS-ohio
+sbgo del AWS-ohio
+# 也可使用配置文件名：sbgo del Socks-8089.json（或 Socks-8089）
+```
+
+节点名含空格时请加引号，例如 `sbgo del "AWS Ohio"`。多个配置匹配时可用完整文件名明确选择。
+已有服务器在发布更新后的管理包及其 `.sha256` 清单后，运行 `sbgo install-mgmt` 即可更新管理命令。
+
 说明：
 
 - `add/del/info/url/qr/change/status/log` 等**转发**给原仓库管理脚本（`sing-box` / `sb` 命令），行为完全一致；用 `sb` 也一样，只是少了 `list`/`nodes`
