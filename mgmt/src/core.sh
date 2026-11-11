@@ -1158,18 +1158,45 @@ get() {
         ;;
     file)
         is_file_str=$2
-        [[ ! $is_file_str ]] && is_file_str='.json$'
-        # is_all_json=("$(ls $is_conf_dir | grep -E $is_file_str)")
-        readarray -t is_all_json <<<"$(ls $is_conf_dir | grep -E -i "$is_file_str" | sed '/dynamic-port-.*-link/d' | head -233)" # limit max 233 lines for show.
-        [[ ! $is_all_json ]] && err "无法找到相关的配置文件: $2"
+        is_all_json=()
+        unset is_config_file is_auto_get_config
+        local f filename tag
+        if [[ -n "$is_file_str" ]]; then
+            # Explicit filenames remain unambiguous and backward compatible.
+            for f in "$is_conf_dir"/*.json; do
+                [[ -f "$f" ]] || continue
+                filename=${f##*/}
+                [[ "$filename" != dynamic-port-*-link* ]] || continue
+                if [[ "$filename" == "$is_file_str" ]]; then
+                    is_all_json=("$filename"); break
+                fi
+            done
+            if [[ ${#is_all_json[@]} -eq 0 ]]; then
+                for f in "$is_conf_dir"/*.json; do
+                    [[ -f "$f" ]] || continue
+                    filename=${f##*/}
+                    [[ "$filename" != dynamic-port-*-link* ]] || continue
+                    tag=$(jq -r '.inbounds[0].tag // empty' "$f" 2>/dev/null) || tag=""
+                    if [[ "${filename,,}" == "${is_file_str,,}" || "${filename%.json}" == "$is_file_str" || "${tag,,}" == "${is_file_str,,}" ]]; then
+                        is_all_json+=("$filename")
+                    fi
+                done
+            fi
+        fi
+        if [[ ${#is_all_json[@]} -eq 0 ]]; then
+            [[ -n "$is_file_str" ]] || is_file_str='.json$'
+            readarray -t is_all_json <<<"$(ls "$is_conf_dir" | grep -E -i "$is_file_str" | sed '/dynamic-port-.*-link/d' | head -233)"
+        fi
+        [[ -n "${is_all_json[0]:-}" ]] || { err "无法找到相关的配置文件或节点名: $2"; return 1; }
         [[ ${#is_all_json[@]} -eq 1 ]] && is_config_file=$is_all_json && is_auto_get_config=1
         [[ ! $is_config_file ]] && {
             [[ $is_dont_auto_exit ]] && return
             ask get_config_file
         }
+        return 0
         ;;
     info)
-        get file "$2"
+        get file "$2" || return 1
         if [[ $is_config_file ]]; then
             is_json_data=$(jq -c '[(.inbounds[0]|.type,.listen_port,(.users[0]|.uuid,.password,.username),.method,.password,.override_port,.override_address,(.transport|.type,.path,.headers.host),(.tls|.server_name,.reality.private_key)),(.outbounds[1].tag)]' "$is_conf_dir/$is_config_file")
             [[ $? != 0 ]] && err "无法读取此文件: $is_config_file"
