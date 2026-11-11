@@ -51,11 +51,16 @@ exit 0
 
 
 class ManagementTests(unittest.TestCase):
-    def run_manager(self, command, node=None, *, invalid=False, fail_start=False, bad_key=False, timeout=15):
+    def run_manager(self, command, node=None, *, invalid=False, fail_start=False, bad_key=False, timeout=15, case_sensitive=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             installed = root / "installed"
             (installed / "conf").mkdir(parents=True)
+            if case_sensitive and os.name == "nt":
+                result = subprocess.run(["fsutil.exe", "file", "setCaseSensitiveInfo", str(installed / "conf"), "enable"],
+                                        capture_output=True, timeout=5)
+                if result.returncode:
+                    self.skipTest("case-sensitive filenames require Linux or Windows case-sensitive directory support")
             (installed / "bin").mkdir()
             (root / "logs").mkdir()
             (root / "logs" / "access.log").write_bytes(b"old log")
@@ -266,6 +271,65 @@ main change node.json port 23456
 ''', node=self.node("hysteria2"))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(files["conf/node.json"], before["conf/node.json"])
+
+    def named_socks_node(self, name="AWS-ohio"):
+        node = self.node("socks")
+        node["tag"] = name
+        node["listen_port"] = 8089
+        node["users"][0]["username"] = "test-user"
+        return node
+
+    def test_delete_by_display_name_resolves_protocol_filename(self):
+        result, nodes, _, _ = self.run_manager(r'''
+mv "$is_conf_dir/node.json" "$is_conf_dir/Socks-8089.json"
+main del AWS-ohio
+''', node=self.named_socks_node())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(nodes, [])
+
+    def test_info_by_display_name_resolves_node(self):
+        result, _, _, _ = self.run_manager('main info AWS-ohio', node=self.named_socks_node())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AWS-ohio", result.stdout)
+        self.assertIn("8089", result.stdout)
+
+    def test_change_by_display_name_preserves_credentials(self):
+        result, nodes, _, _ = self.run_manager('main change AWS-ohio port 9090', node=self.named_socks_node())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(nodes[0]["tag"], "AWS-ohio")
+        self.assertEqual(nodes[0]["listen_port"], 9090)
+        self.assertEqual(nodes[0]["users"][0], {"username": "test-user", "password": "old-password"})
+
+    def test_display_name_with_regex_characters_is_matched_literally(self):
+        result, nodes, _, _ = self.run_manager('main del "AWS.[ohio]"', node=self.named_socks_node("AWS.[ohio]"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(nodes, [])
+
+    def test_delete_by_filename_and_basename_remains_supported(self):
+        for selector in ("Socks-8089.json", "Socks-8089"):
+            with self.subTest(selector=selector):
+                result, nodes, _, _ = self.run_manager(r'''
+mv "$is_conf_dir/node.json" "$is_conf_dir/Socks-8089.json"
+main del SELECTOR
+'''.replace("SELECTOR", selector), node=self.named_socks_node())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(nodes, [])
+
+    def test_unknown_display_name_does_not_delete_another_node(self):
+        result, _, files, before = self.run_manager('main del missing-name', node=self.named_socks_node())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(files, before)
+
+    def test_exact_filename_case_does_not_delete_case_distinct_node(self):
+        result, nodes, files, _ = self.run_manager(r'''
+mv "$is_conf_dir/node.json" "$is_conf_dir/Socks-8089.json"
+jq '.inbounds[0].tag="different-node" | .inbounds[0].listen_port=9090' "$is_conf_dir/Socks-8089.json" > "$is_conf_dir/socks-8089.json"
+main del socks-8089.json
+''', node=self.named_socks_node(), case_sensitive=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("conf/Socks-8089.json", files)
+        self.assertNotIn("conf/socks-8089.json", files)
+        self.assertEqual(nodes[0]["tag"], "AWS-ohio")
 
 
 if __name__ == "__main__":
